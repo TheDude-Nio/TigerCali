@@ -55,6 +55,10 @@ python -m app          # 默认 0.0.0.0:8000，数据目录 ../data
 
 ## 使用流程
 
+| 分配图片 | 审核 |
+| --- | --- |
+| ![分配](docs/screenshots/allocate.png) | ![审核](docs/screenshots/review.png) |
+
 **管理员**
 
 1. 右上角「发布任务」→ 填名称、标注要求、勾选类别 → 创建。

@@ -188,7 +188,9 @@ def _remap_classes(db: Session, task: Task, new_classes: list[dict]) -> None:
         raise HTTPException(400, f"以下类别已有标注，不能删除：{', '.join(sorted(used_missing))}")
     if updates:
         db.execute(update(Image), updates)
-        db.execute(update(Image).where(Image.task_id == task.id, Image.ann_count > 0).values(version=Image.version + 1))
+    # 所有图片（包括空图）版本号 +1：还开着旧页面的人再保存会得到 409，前端据此重新加载类别，
+    # 避免用旧的 class id 写入
+    db.execute(update(Image).where(Image.task_id == task.id).values(version=Image.version + 1))
 
 
 @router.patch("/tasks/{task_id}")

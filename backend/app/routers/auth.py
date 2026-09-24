@@ -192,7 +192,14 @@ def search_users(
         stmt = stmt.where(User.school == school)
     rows = db.execute(stmt.order_by(func.length(User.username), User.username).limit(min(max(limit, 1), 200))).all()
     member_ids: set[int] = set()
-    if task_id is not None and rows:
+    caller_is_manager = task_id is not None and db.scalar(
+        select(TaskMember.id).where(
+            TaskMember.task_id == task_id,
+            TaskMember.user_id == user.id,
+            TaskMember.role.in_(("owner", "manager")),
+        )
+    )
+    if caller_is_manager and rows:
         member_ids = set(
             db.scalars(
                 select(TaskMember.user_id).where(

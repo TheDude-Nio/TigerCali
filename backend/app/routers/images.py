@@ -9,14 +9,15 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.orm import Session
 
 from .. import labels, storage
 from ..config import settings
 from ..db import get_db, iso, utcnow
-from ..deps import get_current_user, is_manager, load_image, load_task, load_task_manager, member_can_view
-from ..models import Image, Task, User
+from ..deps import MANAGER_ROLES, get_current_user, is_manager, load_image, load_task, load_task_manager
+from ..models import Image, Task, TaskMember, User
 
 router = APIRouter(prefix="/api", tags=["images"])
 
@@ -44,6 +45,23 @@ class FlagIn(BaseModel):
 
 class IdsIn(BaseModel):
     ids: list[int] = Field(min_length=1, max_length=100000)
+
+
+def _insert_ignore_duplicates(db: Session, rows: list[dict[str, Any]]) -> int:
+    """插入图片，同一任务内 sha1 重复的直接跳过（并发上传同一张图时不会 500）。返回实际插入数。"""
+    dialect = sqlite if db.get_bind().dialect.name == "sqlite" else postgresql
+    stmt = (
+        dialect.insert(Image.__table__)
+        .on_conflict_do_nothing(index_elements=["task_id", "sha1"])
+        .returning(Image.__table__.c.id)
+    )
+    return len(db.execute(stmt, rows).all())
+
+
+def _check_view(db: Session, img: Image, user: User, manager: bool) -> None:
+    # 标注员只能看分配给自己的图片；管理员可以看任务里所有图片
+    if not manager and img.assignee_id != user.id:
+        raise HTTPException(404, "图片不存在")
 
 
 def image_out(img: Image) -> dict[str, Any]:
@@ -145,9 +163,10 @@ def upload_images(
                 }
             )
         if rows:
-            db.execute(insert(Image), rows)
+            inserted = _insert_ignore_duplicates(db, rows)
             db.commit()
-            added += len(rows)
+            added += inserted
+            duplicates += len(rows) - inserted
 
     batch: list[tuple[str, bytes]] = []
     for item in _iter_uploads(files, label_texts, errors):
@@ -321,18 +340,22 @@ def batch_details(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> JSONResponse:
-    load_task(db, task_id, user)
+    _, member = load_task(db, task_id, user)
     try:
         id_list = [int(x) for x in ids.split(",") if x.strip()][:100]
     except ValueError as e:
         raise HTTPException(400, "ids 参数错误") from e
-    items = db.scalars(select(Image).where(Image.task_id == task_id, Image.id.in_(id_list))).all()
+    stmt = select(Image).where(Image.task_id == task_id, Image.id.in_(id_list))
+    if not is_manager(member):
+        stmt = stmt.where(Image.assignee_id == user.id)
+    items = db.scalars(stmt).all()
     return JSONResponse({"items": [image_out(i) for i in items]})
 
 
 @router.get("/images/{image_id}")
 def get_image(image_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> JSONResponse:
-    img, _, _ = load_image(db, image_id, user)
+    img, _, member = load_image(db, image_id, user)
+    _check_view(db, img, user, is_manager(member))
     return JSONResponse(image_out(img))
 
 
@@ -433,8 +456,12 @@ def delete_images(
 
 
 def _file_row(db: Session, image_id: int, user: User) -> tuple[int, str, str]:
-    row = db.execute(select(Image.task_id, Image.sha1, Image.ext).where(Image.id == image_id)).first()
-    if row is None or not member_can_view(db, row[0], user.id):
+    row = db.execute(
+        select(Image.task_id, Image.sha1, Image.ext, Image.assignee_id, TaskMember.role)
+        .join(TaskMember, (TaskMember.task_id == Image.task_id) & (TaskMember.user_id == user.id))
+        .where(Image.id == image_id)
+    ).first()
+    if row is None or (row.role not in MANAGER_ROLES and row.assignee_id != user.id):
         raise HTTPException(404, "图片不存在")
     return row[0], row[1], row[2]
 

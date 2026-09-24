@@ -299,7 +299,7 @@ async function doAssign() {
             <option value="annotator">标注员</option>
             <option value="manager">管理员</option>
           </select>
-          <button class="btn btn-primary" :disabled="!picked.size" @click="addPicked">添加 {{ picked.size || '' }} 人</button>
+          <button class="btn btn-primary" :disabled="!picked.size" @click="addPicked">{{ picked.size ? `添加 ${picked.size} 人` : '添加' }}</button>
         </div>
       </div>
 

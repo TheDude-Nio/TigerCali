@@ -6,7 +6,7 @@ import { Editor } from '../annotator/editor'
 import { BitmapCache } from '../annotator/imageCache'
 import { ApiError, api, errMsg } from '../api'
 import MarkdownView from '../components/MarkdownView.vue'
-import { confirmDialog, metaStore, toast } from '../store'
+import { confirmDialog, dialog, metaStore, toast } from '../store'
 import type { Ann, ImageDetail, ImageItem, ImageStatus, Task } from '../types'
 import { IMAGE_STATUS, basename, classColor, classLabel, debounce } from '../utils'
 
@@ -59,6 +59,7 @@ const flagNote = ref('')
 
 const canvasEl = ref<HTMLCanvasElement | null>(null)
 let editor: Editor | null = null
+let listRO: ResizeObserver | null = null
 const bitmaps = new BitmapCache(24)
 
 interface ImgState {
@@ -332,6 +333,8 @@ async function doSave(st: ImgState, done: boolean) {
           annsView.value = cloneAnns(fresh.annotations)
         }
       }
+      // 冲突也可能是管理员改了类别（所有图片版本号都会变），重新加载任务拿最新类别
+      await reloadTask()
       toast(e.message, 'warn', 4000)
     } else if (e instanceof ApiError && e.status >= 400 && e.status < 500) {
       // 状态类错误（已提交、任务结束等），重试也没用
@@ -349,15 +352,15 @@ async function doSave(st: ImgState, done: boolean) {
   }
 }
 
-const autosave = debounce(() => {
-  const st = currentState()
-  if (st) save(st, false)
-}, 600)
+function saveDirty() {
+  for (const st of states.values()) if (st.seq !== st.saved) save(st, false)
+}
+
+const autosave = debounce(saveDirty, 600)
 
 function flush() {
   autosave.cancel()
-  const st = currentState()
-  if (st && st.seq !== st.saved) save(st, false)
+  saveDirty()
 }
 
 async function flushAll() {
@@ -527,6 +530,10 @@ async function submitTask() {
 async function reloadTask() {
   try {
     task.value = await api.get<Task>(`/api/tasks/${taskId}`)
+    if (editor) {
+      editor.autoSort = task.value.settings.auto_sort
+      editor.requestRender()
+    }
   } catch {
     /* ignore */
   }
@@ -549,6 +556,15 @@ function onKeyDown(e: KeyboardEvent) {
     if (e.key === 'Escape') (e.target as HTMLElement).blur()
     return
   }
+  // 确认框 / 帮助 / 标注要求打开时，快捷键不作用到画布（比如确认提交时按 D 不能去标下一张）
+  if (dialog.open) return
+  if (ui.help || ui.req) {
+    if (e.key === 'Escape' || (ui.help && (e.key === '?' || e.key === '/'))) {
+      ui.help = false
+      ui.req = false
+    }
+    return
+  }
   const k = e.key
   const lower = k.length === 1 ? k.toLowerCase() : k
   const ctrl = e.ctrlKey || e.metaKey
@@ -568,10 +584,6 @@ function onKeyDown(e: KeyboardEvent) {
     return
   }
   if (e.altKey) return
-  if (ui.help && k === 'Escape') {
-    ui.help = false
-    return
-  }
   const step = e.shiftKey ? 0.2 : 1
   switch (lower) {
     case ' ':
@@ -662,25 +674,39 @@ function onBlur() {
   editor?.setSpace(false)
 }
 
+function hasUnsaved(): boolean {
+  for (const st of states.values()) if (st.seq !== st.saved) return true
+  return false
+}
+
 function onBeforeUnload(e: BeforeUnloadEvent) {
-  let dirty = false
-  for (const st of states.values()) {
-    if (st.seq !== st.saved) {
-      dirty = true
-      // 尽力而为：keepalive 请求在页面关闭后也会发出
-      api
-        .put(`/api/images/${st.d.id}/annotations`, { annotations: st.d.annotations, version: st.d.version }, { keepalive: true })
-        .catch(() => undefined)
-    }
-  }
-  if (dirty || savingCount.value > 0) {
+  if (!readonly.value && (hasUnsaved() || savingCount.value > 0)) {
+    flush()
     e.preventDefault()
     e.returnValue = ''
   }
 }
 
+function onPageHide() {
+  // 页面真的要关了：用 keepalive 请求尽力把没保存的发出去（页面关闭后请求也会继续）
+  if (readonly.value) return
+  for (const st of states.values()) {
+    if (st.seq === st.saved) continue
+    api
+      .put(`/api/images/${st.d.id}/annotations`, { annotations: st.d.annotations, version: st.d.version }, { keepalive: true })
+      .catch(() => undefined)
+  }
+}
+
 onBeforeRouteLeave(async () => {
   await flushAll()
+  // 保存失败（比如断网）时不能悄悄丢掉修改
+  if (!readonly.value && hasUnsaved()) {
+    return await confirmDialog('有修改还没保存成功', '网络可能断开了，现在离开这些修改会丢失。确定离开吗？', {
+      danger: true,
+      okText: '仍然离开',
+    })
+  }
 })
 
 // ---------------------------------------------------------------- 生命周期
@@ -723,6 +749,7 @@ onMounted(async () => {
   window.addEventListener('keyup', onKeyUp)
   window.addEventListener('blur', onBlur)
   window.addEventListener('beforeunload', onBeforeUnload)
+  window.addEventListener('pagehide', onPageHide)
   try {
     const [t, list] = await Promise.all([
       api.get<Task>(`/api/tasks/${taskId}`),
@@ -761,6 +788,10 @@ onMounted(async () => {
   editor.autoSort = t.settings.auto_sort
   editor.loupe = ui.loupe
   onListScroll()
+  if (listEl.value) {
+    listRO = new ResizeObserver(onListScroll)
+    listRO.observe(listEl.value)
+  }
 
   const wantId = Number(route.query.image)
   let start = items.value.findIndex((it) => it.id === wantId)
@@ -774,6 +805,8 @@ onBeforeUnmount(() => {
   window.removeEventListener('keyup', onKeyUp)
   window.removeEventListener('blur', onBlur)
   window.removeEventListener('beforeunload', onBeforeUnload)
+  window.removeEventListener('pagehide', onPageHide)
+  listRO?.disconnect()
   clearInterval(retryTimer)
   editor?.destroy()
   editor = null

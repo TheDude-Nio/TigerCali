@@ -46,6 +46,13 @@ class _ZipSink(io.RawIOBase):
         return out
 
 
+def _val_count(n: int, val_ratio: float) -> int:
+    """验证集张数：至少给训练集留 1 张。"""
+    if n <= 1:
+        return 0
+    return min(int(round(n * val_ratio)), n - 1)
+
+
 def _yaml_str(s: str) -> str:
     return json.dumps(s, ensure_ascii=False)
 
@@ -139,7 +146,7 @@ def export_dataset(
     ).all()
     if preview:
         n = len(rows)
-        n_val_preview = int(round(n * val_ratio)) if n > 1 and fmt != "json" else 0
+        n_val_preview = _val_count(n, val_ratio) if fmt != "json" else 0
         return JSONResponse(
             {
                 "images": n,
@@ -156,15 +163,17 @@ def export_dataset(
     used: set[str] = set()
     items = []
     for r in rows:
-        stem = _SAFE.sub("_", PurePosixPath(r.filename).stem)[:120] or "img"
-        if stem.lower() in used:
-            stem = f"{stem}_{r.id}"
+        base = _SAFE.sub("_", PurePosixPath(r.filename).stem)[:120] or "img"
+        stem, k = base, 0
+        while stem.lower() in used:  # 同名文件：加 _id，仍冲突就继续加序号
+            k += 1
+            stem = f"{base}_{r.id}" if k == 1 else f"{base}_{r.id}_{k}"
         used.add(stem.lower())
         items.append((r, stem))
 
     order = list(range(len(items)))
     random.Random(seed).shuffle(order)
-    n_val = int(round(len(items) * val_ratio)) if len(items) > 1 else 0
+    n_val = _val_count(len(items), val_ratio)
     val_set = set(order[:n_val])
     classes = task.classes
     task_snapshot = Task(name=task.name, classes=classes, label_config=task.label_config)

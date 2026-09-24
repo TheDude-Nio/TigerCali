@@ -39,6 +39,8 @@ class AuthSession(Base):
 
 class Task(Base):
     __tablename__ = "tasks"
+    # 删除后 id 不复用：图片 URL 按 id 永久缓存，复用会让浏览器显示旧图
+    __table_args__ = {"sqlite_autoincrement": True}
 
     id: Mapped[int] = mapped_column(primary_key=True)
     owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
@@ -80,6 +82,7 @@ class Image(Base):
         UniqueConstraint("task_id", "sha1", name="uq_image_sha1"),
         Index("ix_images_task_sort", "task_id", "sort_key"),
         Index("ix_images_task_assignee_status", "task_id", "assignee_id", "status"),
+        {"sqlite_autoincrement": True},
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)

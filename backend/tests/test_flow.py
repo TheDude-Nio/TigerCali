@@ -299,3 +299,66 @@ def test_attachments_and_split(world: dict) -> None:
     assert admin.get(url).status_code == 200
     assert world["bob"].get(url).status_code == 200
     assert client_for("stranger").get(url).status_code == 404
+
+
+def test_review_regressions(world: dict) -> None:
+    """代码审查发现的问题的回归测试。"""
+    admin, alice, bob = world["admin"], world["alice"], world["bob"]
+    ids = world["ids"]
+    tid = admin.post("/api/tasks", json={"name": "regress", "label_config": {"mode": "armor", "colors": ["B"], "tags": ["1", "3"]}}).json()["id"]
+
+    # 删除后重新上传，图片 id 不能复用（URL 永久缓存）
+    up = lambda name, color: admin.post(f"/api/tasks/{tid}/images", files=[("files", (name, jpeg(color), "image/jpeg"))])
+    up("x.jpg", (9, 9, 9))
+    old = admin.get(f"/api/tasks/{tid}/image-list", params={"assignee": "all"}).json()["items"][0]["id"]
+    admin.post(f"/api/tasks/{tid}/images/delete", json={"ids": [old]})
+    up("y.jpg", (8, 8, 8))
+    new = admin.get(f"/api/tasks/{tid}/image-list", params={"assignee": "all"}).json()["items"][0]["id"]
+    assert new > old
+
+    # 同名文件导出时不能互相覆盖：a/foo, a/foo_<id>, b/foo
+    files = [("files", ("a/foo.jpg", jpeg((1, 1, 1)), "image/jpeg")), ("files", ("b/foo.jpg", jpeg((2, 2, 2)), "image/jpeg"))]
+    admin.post(f"/api/tasks/{tid}/images", files=files)
+    items = admin.get(f"/api/tasks/{tid}/image-list", params={"assignee": "all"}).json()["items"]
+    b_id = next(i["id"] for i in items if i["filename"] == "b/foo.jpg")
+    admin.post(f"/api/tasks/{tid}/images", files=[("files", (f"a/foo_{b_id}.jpg", jpeg((3, 3, 3)), "image/jpeg"))])
+    r = admin.get(f"/api/tasks/{tid}/export", params={"scope": "all", "val_ratio": 0.9})
+    names = zipfile.ZipFile(io.BytesIO(r.content)).namelist()
+    imgs = [n for n in names if n.startswith("images/")]
+    assert len(imgs) == len(set(imgs)) == 4
+    # 验证集比例很大时训练集也至少留 1 张
+    assert sum(1 for n in imgs if n.startswith("images/train/")) >= 1
+
+    # 并发上传同一张图：第二次插入直接跳过，不报 500
+    from app.db import SessionLocal
+    from app.routers.images import _insert_ignore_duplicates
+
+    sha = next(i for i in items if i["filename"] == "a/foo.jpg")
+    with SessionLocal() as db:
+        from app.models import Image
+
+        src = db.get(Image, sha["id"])
+        row = {c: getattr(src, c) for c in ("task_id", "filename", "sort_key", "sha1", "ext", "width", "height", "size")}
+        assert _insert_ignore_duplicates(db, [row, row]) == 0
+        db.rollback()
+
+    # 标注员只能看分配给自己的图片
+    admin.post(f"/api/tasks/{tid}/members", json={"user_ids": [ids["alice"], ids["bob"]]})
+    admin.post(f"/api/tasks/{tid}/assign", json={"mode": "count", "entries": [{"user_id": ids["alice"], "value": 1}]})
+    a_img = alice.get(f"/api/tasks/{tid}/image-list").json()["items"][0]["id"]
+    assert alice.get(f"/api/images/{a_img}/file").status_code == 200
+    assert bob.get(f"/api/images/{a_img}").status_code == 404
+    assert bob.get(f"/api/images/{a_img}/file").status_code == 404
+    assert bob.get(f"/api/images/{a_img}/thumb").status_code == 404
+    assert bob.get(f"/api/tasks/{tid}/images/batch", params={"ids": str(a_img)}).json()["items"] == []
+
+    # 非管理员不能通过用户搜索探测任务成员
+    found = bob.get("/api/users", params={"q": "alice", "task_id": tid}).json()
+    assert found and not any(u["is_member"] for u in found)
+    assert any(u["is_member"] for u in admin.get("/api/users", params={"q": "alice", "task_id": tid}).json())
+
+    # 改类别后，空图的版本号也要变：旧页面保存会冲突而不是用旧 class id 写入
+    v0 = alice.get(f"/api/images/{a_img}").json()["version"]
+    admin.patch(f"/api/tasks/{tid}", json={"label_config": {"mode": "armor", "colors": ["B"], "tags": ["G", "1", "3"]}})
+    r = alice.put(f"/api/images/{a_img}/annotations", json={"annotations": [{"cls": 1, "pts": [[1, 1], [1, 5], [9, 5], [9, 1]]}], "version": v0})
+    assert r.status_code == 409
