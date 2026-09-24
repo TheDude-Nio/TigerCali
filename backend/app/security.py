@@ -73,5 +73,10 @@ class LoginLimiter:
         with self._lock:
             self._fails.pop(key, None)
 
+    # 用作普通计数器时更直观的名字
+    hit = fail
+
 
 login_limiter = LoginLimiter()
+# 同一 IP 每小时最多注册 200 个账号：挡住脚本刷号，又不会误伤整个实验室共用一个出口 IP 集中注册
+register_limiter = LoginLimiter(max_fail=200, window=3600)

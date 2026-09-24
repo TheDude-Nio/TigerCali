@@ -30,7 +30,12 @@ docker compose up -d --build
 # 打开 http://服务器IP:8000 ，注册账号即可使用
 ```
 
-数据（SQLite 数据库、原图、缩略图）全部在 `./data`，**备份只需复制这个目录**。
+数据（SQLite 数据库、原图、缩略图）全部在 `./data`。备份时先停服务再复制整个目录；不想停服务的话，用 SQLite 的在线备份导出数据库，图片目录直接复制：
+
+```bash
+sqlite3 data/tigercali.db ".backup 'backup/tigercali.db'"
+rsync -a data/images data/thumbs data/attachments backup/
+```
 
 ### 方式二：直接运行
 

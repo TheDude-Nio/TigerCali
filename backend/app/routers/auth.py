@@ -13,7 +13,7 @@ from ..config import settings
 from ..db import get_db, iso, utcnow
 from ..deps import COOKIE_NAME, get_current_user
 from ..models import AuthSession, TaskMember, User
-from ..security import hash_password, login_limiter, new_token, token_hash, verify_password
+from ..security import hash_password, login_limiter, new_token, register_limiter, token_hash, verify_password
 
 router = APIRouter(prefix="/api", tags=["auth"])
 
@@ -85,7 +85,10 @@ def get_meta() -> dict:
 
 
 @router.post("/auth/register")
-def register(body: RegisterIn, response: Response, db: Session = Depends(get_db)) -> dict:
+def register(body: RegisterIn, request: Request, response: Response, db: Session = Depends(get_db)) -> dict:
+    ip = request.client.host if request.client else "-"
+    if register_limiter.blocked(ip):
+        raise HTTPException(429, "注册太频繁，请稍后再试")
     if settings.invite_code and body.invite_code.strip() != settings.invite_code:
         raise HTTPException(403, "邀请码错误")
     username = body.username.strip()
@@ -100,6 +103,7 @@ def register(body: RegisterIn, response: Response, db: Session = Depends(get_db)
     db.flush()
     _start_session(db, user, response)
     db.commit()
+    register_limiter.hit(ip)
     return user_out(user)
 
 

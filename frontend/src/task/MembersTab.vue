@@ -161,8 +161,10 @@ const preview = computed<Record<number, number>>(() => {
     const exact = list.map((m) => (n * Math.max(0, alloc.values[m.user_id] || 0)) / 100)
     const counts = exact.map(Math.floor)
     const target = Math.min(n, Math.round(exact.reduce((a, b) => a + b, 0)))
-    const order = exact.map((x, i) => [x - counts[i], i] as const).sort((a, b) => b[0] - a[0])
-    for (let k = 0; k < target - counts.reduce((a, b) => a + b, 0) && k < order.length; k++) counts[order[k][1]]++
+    // 最大余数法，与后端 _split_counts 保持一致
+    const order = exact.map((x, i) => [x - counts[i], i] as const).sort((a, b) => b[0] - a[0] || a[1] - b[1])
+    const need = Math.max(0, target - counts.reduce((a, b) => a + b, 0))
+    for (let k = 0; k < need && k < order.length; k++) counts[order[k][1]]++
     list.forEach((m, i) => (out[m.user_id] = counts[i]))
   }
   return out
