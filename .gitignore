@@ -1,0 +1,19 @@
+# 数据目录（图片、数据库）
+/data/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# 前端
+frontend/node_modules/
+frontend/dist/
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
+*.log

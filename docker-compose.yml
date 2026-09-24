@@ -1,0 +1,16 @@
+services:
+  tigercali:
+    build: .
+    image: tigercali:latest
+    container_name: tigercali
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # 数据库、图片、缩略图都在这里，备份只需要复制这个目录
+      - ./data:/data
+    environment:
+      # 设置后注册需要填写邀请码（公网部署强烈建议设置）
+      TIGERCALI_INVITE_CODE: ""
+      # 通过 HTTPS 访问时改成 "1"
+      TIGERCALI_SECURE_COOKIE: "0"
