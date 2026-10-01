@@ -5,6 +5,7 @@ import { api, errMsg } from '../api'
 import AnnotatedThumb from '../components/AnnotatedThumb.vue'
 import Pager from '../components/Pager.vue'
 import ProgressBar from '../components/ProgressBar.vue'
+import StatCard from '../components/StatCard.vue'
 import { confirmDialog, promptDialog, toast } from '../store'
 import type { ImageDetail, MemberStat, Page, Task, TaskStats } from '../types'
 import { IMAGE_STATUS, MEMBER_STATUS, basename, fmtTime } from '../utils'
@@ -151,7 +152,7 @@ async function reject() {
 </script>
 
 <template>
-  <div class="page review-page">
+  <div class="page">
     <div class="page-head">
       <router-link :to="{ path: `/tasks/${taskId}`, query: { tab: 'review' } }" class="btn btn-sm">← 返回</router-link>
       <div v-if="member" class="col" style="gap: 2px">
@@ -173,19 +174,17 @@ async function reject() {
     </div>
 
     <div v-if="member" class="grid-4 mb-16">
-      <div class="stat">
-        <ProgressBar :value="member.done" :total="member.assigned" :green="member.done === member.assigned" label />
-        <div class="lbl mt-8">完成进度</div>
-      </div>
-      <div class="stat"><div class="num">{{ member.ann_count }}</div><div class="lbl">装甲板总数</div></div>
-      <div class="stat">
-        <div class="num" :style="{ color: member.flagged ? 'var(--red)' : '' }">{{ member.flagged }}</div>
-        <div class="lbl">标记有问题</div>
-      </div>
-      <div class="stat">
-        <div class="num">{{ member.assigned ? (member.ann_count / member.assigned).toFixed(2) : 0 }}</div>
-        <div class="lbl">平均每张装甲板数</div>
-      </div>
+      <StatCard icon="check" tone="green" label="完成进度">
+        <ProgressBar class="stat-bar" :value="member.done" :total="member.assigned" :green="member.done === member.assigned" label />
+      </StatCard>
+      <StatCard icon="target" tone="purple" :value="member.ann_count" label="装甲板总数" />
+      <StatCard icon="flag" :tone="member.flagged ? 'red' : 'gray'" :value="member.flagged" label="标记有问题" />
+      <StatCard
+        icon="chart"
+        tone="blue"
+        :value="member.assigned ? (member.ann_count / member.assigned).toFixed(2) : 0"
+        label="平均每张装甲板数"
+      />
     </div>
 
     <div v-if="member?.review_comment" class="notice notice-warn mb-16">上次审核意见：{{ member.review_comment }}</div>
@@ -249,13 +248,14 @@ async function reject() {
 </template>
 
 <style scoped>
-.review-page {
-  max-width: 1600px;
+/* 与旁边统计卡的数字行等高 */
+.stat-bar {
+  height: 29px;
 }
 .flag-btn {
   border: 1px solid var(--border);
   border-radius: 4px;
-  background: #fff;
+  background: var(--panel);
   color: var(--text-3);
   cursor: pointer;
   padding: 0 6px;
@@ -263,7 +263,7 @@ async function reject() {
 }
 .flag-btn:hover {
   color: var(--red);
-  border-color: #fca5a5;
+  border-color: #e6bbb5;
 }
 .flag-btn.on {
   background: var(--red);

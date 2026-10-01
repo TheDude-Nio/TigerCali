@@ -28,6 +28,13 @@ class Settings:
         self.max_image_mb = int(_env("MAX_IMAGE_MB", "64"))
         self.thumb_size = int(_env("THUMB_SIZE", "320"))
         self.upload_workers = int(_env("UPLOAD_WORKERS", str(min(8, os.cpu_count() or 2))))
+        # 只有来自这些地址（反向代理）的 X-Forwarded-For 才可信。登录/注册限流按客户端 IP 计数，
+        # 信任任意来源（"*"）时客户端伪造这个头就能无限换 IP 绕过限流
+        self.forwarded_allow_ips = _env("FORWARDED_ALLOW_IPS", "127.0.0.1,::1") or ""
+        # 预标注模型（ONNX）。放在数据目录里，Docker 部署时随数据卷一起挂载；文件不存在时预标注功能自动关闭
+        self.smart_model = Path(
+            _env("SMART_MODEL", "") or str(self.data_dir / "models" / "armor.onnx")
+        ).expanduser().resolve()
 
         self.data_dir.mkdir(parents=True, exist_ok=True)
 

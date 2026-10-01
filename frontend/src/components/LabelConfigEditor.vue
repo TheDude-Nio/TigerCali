@@ -117,7 +117,7 @@ const preview = computed(() => {
   padding: 12px;
   border: 1px dashed var(--border-strong);
   border-radius: 8px;
-  background: #fafbfc;
+  background: var(--panel-2);
 }
 .cls-list {
   display: flex;
@@ -129,7 +129,7 @@ const preview = computed(() => {
   gap: 6px;
   padding: 2px 8px;
   border-radius: 4px;
-  background: #fff;
+  background: var(--panel);
   border: 1px solid var(--border);
   font-family: var(--mono);
   font-size: 12px;

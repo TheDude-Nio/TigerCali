@@ -26,6 +26,8 @@ export interface Meta {
   armor_tags: ArmorTag[]
   export_formats: { key: string; name: string; line: string }[]
   point_orders: { key: string; name: string }[]
+  /** 服务器装了 onnxruntime 且有模型文件时为 true，前端据此显示「智能预标」 */
+  smart_available?: boolean
 }
 
 export interface ClassDef {

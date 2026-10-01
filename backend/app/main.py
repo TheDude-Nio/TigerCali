@@ -8,12 +8,46 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from sqlalchemy import select, update
+
 from . import models  # noqa: F401  注册表结构
+from . import storage
 from .config import settings
-from .db import Base, engine
+from .db import Base, SessionLocal, engine
 from .routers import auth, export, images, members, tasks
 
 Base.metadata.create_all(engine)
+
+
+def refresh_sort_keys(batch: int = 5000) -> int:
+    """按当前 natural_key 规则重算 images.sort_key，返回改动的行数。
+
+    排序键存在库里，编码规则改过之后旧行必须重算，否则同一任务里新旧编码混排、顺序错乱。
+    按主键分页读、只更新不一致的行：内存占用有上限，已是最新时只是一遍只读扫描，重复执行无副作用。
+    """
+    changed = 0
+    last_id = 0
+    with SessionLocal() as db:
+        while True:
+            rows = db.execute(
+                select(models.Image.id, models.Image.filename, models.Image.sort_key)
+                .where(models.Image.id > last_id)
+                .order_by(models.Image.id)
+                .limit(batch)
+            ).all()
+            if not rows:
+                return changed
+            last_id = rows[-1].id
+            updates = [
+                {"id": r.id, "sort_key": key} for r in rows if (key := storage.natural_key(r.filename)) != r.sort_key
+            ]
+            if updates:
+                db.execute(update(models.Image), updates)
+                db.commit()
+                changed += len(updates)
+
+
+refresh_sort_keys()
 
 app = FastAPI(title="华南虎一起标", docs_url="/api/docs", openapi_url="/api/openapi.json", redoc_url=None)
 

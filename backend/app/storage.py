@@ -26,8 +26,16 @@ executor = ThreadPoolExecutor(max_workers=settings.upload_workers, thread_name_p
 _DIGITS = re.compile(r"\d+")
 
 
+def _encode_number(m: re.Match[str]) -> str:
+    # 「两位位数 + 数字」：位数少的数一定更小，同位数再逐位比，对任意长度都成立。
+    # 以前补零到固定 12 位，13 位以上的数（如毫秒时间戳与更短的数混排）会排错
+    digits = m.group(0).lstrip("0") or "0"
+    return f"{min(len(digits), 99):02d}{digits}"
+
+
 def natural_key(name: str) -> str:
-    return _DIGITS.sub(lambda m: m.group(0).lstrip("0").zfill(12), name.lower())[:512]
+    """存进 images.sort_key。改编码规则后要让 main.refresh_sort_keys 把旧数据重算一遍。"""
+    return _DIGITS.sub(_encode_number, name.lower())[:512]
 
 
 def is_image_name(name: str) -> bool:

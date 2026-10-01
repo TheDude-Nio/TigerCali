@@ -110,6 +110,6 @@ async function toggleStatus() {
 
 <style scoped>
 .danger-zone {
-  border-color: #fecaca;
+  border-color: #f0cbc6;
 }
 </style>

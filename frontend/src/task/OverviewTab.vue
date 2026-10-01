@@ -3,6 +3,7 @@ import { computed } from 'vue'
 import { api, errMsg } from '../api'
 import MarkdownView from '../components/MarkdownView.vue'
 import ProgressBar from '../components/ProgressBar.vue'
+import StatCard from '../components/StatCard.vue'
 import { confirmDialog, toast } from '../store'
 import type { Task, TaskStats } from '../types'
 import { MEMBER_STATUS, ROLE_TEXT, pct } from '../utils'
@@ -12,16 +13,21 @@ const props = defineProps<{ task: Task; stats: TaskStats | null }>()
 const emit = defineEmits<{ (e: 'refresh'): void; (e: 'tab', t: TabKey): void }>()
 
 const workers = computed(() => (props.stats?.members ?? []).filter((m) => m.assigned > 0 || m.role === 'annotator'))
-const steps = computed(() => {
+// 只提示当前该做的一件事。各步骤并不严格按顺序完成（比如管理员可以不加人、直接分给自己），
+// 逐项打勾会出现「第 2 步没勾、第 3 步勾了」的混乱状态
+const nextStep = computed<{ tag: string; text: string; action?: string; tab?: TabKey } | null>(() => {
   const s = props.stats
-  return [
-    { done: !!s && s.total > 0, text: '上传图片', tab: 'images' as TabKey },
-    { done: !!s && s.members.length > 1, text: '添加标注员', tab: 'members' as TabKey },
-    { done: !!s && s.total > 0 && s.unassigned === 0, text: '分配图片', tab: 'members' as TabKey },
-    { done: !!s && s.total > 0 && s.done === s.total, text: '等待标注完成', tab: 'overview' as TabKey },
-    { done: props.task.status === 'finished', text: '审核通过', tab: 'review' as TabKey },
-    { done: false, text: '导出 YOLO 数据集', tab: 'export' as TabKey },
-  ]
+  if (!s) return null
+  if (s.total === 0) return { tag: '下一步', text: '还没有图片：上传图片、文件夹或 zip，可附带预标注 txt', action: '上传图片', tab: 'images' }
+  if (s.unassigned > 0) {
+    return s.members.length > 1
+      ? { tag: '下一步', text: `还有 ${s.unassigned} 张图片没有分配`, action: '分配图片', tab: 'members' }
+      : { tag: '下一步', text: '把队员加入任务，再把图片分配给他们（也可以分给自己）', action: '添加成员', tab: 'members' }
+  }
+  if (props.task.status === 'finished') return { tag: '已完成', text: '全部图片已审核通过，可以导出数据集训练了', action: '导出数据集', tab: 'export' }
+  const submitted = s.members.filter((m) => m.status === 'submitted').length
+  if (submitted) return { tag: '下一步', text: `${submitted} 人已提交，等待你审核`, action: '去审核', tab: 'review' }
+  return { tag: '进行中', text: `正在标注：已完成 ${s.done} / ${s.total} 张，标注员提交后会在这里提醒你审核` }
 })
 
 async function setStatus(status: 'active' | 'finished') {
@@ -39,25 +45,18 @@ async function setStatus(status: 'active' | 'finished') {
 
 <template>
   <div v-if="stats">
-    <div class="card">
-      <div class="steps">
-        <button v-for="(s, i) in steps" :key="i" class="step" :class="{ done: s.done }" @click="emit('tab', s.tab)">
-          <span class="step-no">{{ s.done ? '✓' : i + 1 }}</span>{{ s.text }}
-        </button>
-      </div>
+    <div v-if="nextStep" class="next">
+      <span class="next-tag">{{ nextStep.tag }}</span>
+      <span>{{ nextStep.text }}</span>
+      <div class="spacer" />
+      <button v-if="nextStep.tab" class="btn btn-sm btn-primary" @click="emit('tab', nextStep.tab)">{{ nextStep.action }} →</button>
     </div>
 
     <div class="grid-4 mt-16">
-      <div class="stat"><div class="num">{{ stats.total }}</div><div class="lbl">图片总数</div></div>
-      <div class="stat">
-        <div class="num">{{ stats.done }}</div>
-        <div class="lbl">已完成 {{ pct(stats.done, stats.total) }}%</div>
-      </div>
-      <div class="stat">
-        <div class="num" :style="{ color: stats.unassigned ? 'var(--orange)' : '' }">{{ stats.unassigned }}</div>
-        <div class="lbl">未分配</div>
-      </div>
-      <div class="stat"><div class="num">{{ stats.ann_count }}</div><div class="lbl">装甲板标注数 · 今日完成 {{ stats.done_today }} 张</div></div>
+      <StatCard icon="image" tone="blue" :value="stats.total" label="图片总数" />
+      <StatCard icon="check" tone="green" :value="stats.done" :label="`已完成 ${pct(stats.done, stats.total)}%`" />
+      <StatCard icon="inbox" :tone="stats.unassigned ? 'brand' : 'gray'" :value="stats.unassigned" label="未分配" />
+      <StatCard icon="target" tone="purple" :value="stats.ann_count" :label="`装甲板标注数 · 今日完成 ${stats.done_today} 张`" />
     </div>
 
     <div class="card mt-16">
@@ -127,44 +126,24 @@ async function setStatus(status: 'active' | 'finished') {
 </template>
 
 <style scoped>
-.steps {
+.next {
   display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-.step {
-  display: inline-flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 12px 6px 6px;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 12px 14px 12px 16px;
   border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+.next-tag {
+  padding: 2px 10px;
   border-radius: 999px;
-  background: #fff;
-  font: inherit;
-  color: var(--text-2);
-  cursor: pointer;
-}
-.step:hover {
-  border-color: var(--brand);
-}
-.step-no {
-  display: grid;
-  place-items: center;
-  width: 22px;
-  height: 22px;
-  border-radius: 50%;
-  background: #eef0f3;
+  background: var(--brand-50);
+  color: var(--brand-600);
   font-size: 12px;
-  font-weight: 700;
-}
-.step.done {
-  color: var(--green);
-  border-color: #bbf7d0;
-  background: #f0fdf4;
-}
-.step.done .step-no {
-  background: var(--green);
-  color: #fff;
+  font-weight: 600;
 }
 .req {
   max-height: 320px;

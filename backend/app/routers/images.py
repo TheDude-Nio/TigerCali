@@ -13,7 +13,7 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.orm import Session
 
-from .. import labels, storage
+from .. import labels, smart, storage
 from ..config import settings
 from ..db import get_db, iso, utcnow
 from ..deps import MANAGER_ROLES, get_current_user, is_manager, load_image, load_task, load_task_manager
@@ -45,6 +45,11 @@ class FlagIn(BaseModel):
 
 class IdsIn(BaseModel):
     ids: list[int] = Field(min_length=1, max_length=100000)
+
+
+class SmartIn(BaseModel):
+    # 前端按批循环调用并显示进度；一批 50 张、每张几十毫秒，单次请求保持在几秒内
+    ids: list[int] = Field(min_length=1, max_length=50)
 
 
 def _insert_ignore_duplicates(db: Session, rows: list[dict[str, Any]]) -> int:
@@ -86,6 +91,20 @@ def image_out(img: Image) -> dict[str, Any]:
 # ---------------------------------------------------------------- 上传
 
 
+def _zip_entry_name(info: zipfile.ZipInfo) -> str:
+    # 没有 UTF-8 标志位的条目 zipfile 一律按 cp437 解码，而 Windows 中文系统打的包实际是 GBK，
+    # 直接用就是乱码。cp437 能无损还原原始字节；先试 UTF-8（不少工具写 UTF-8 却不设标志位），再试 GBK
+    if info.flag_bits & 0x800:
+        return info.filename
+    raw = info.filename.encode("cp437")
+    for encoding in ("utf-8", "gbk"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return info.filename
+
+
 def _iter_uploads(files: list[UploadFile], label_texts: dict[str, str], skipped: list[str]) -> Iterator[tuple[str, bytes]]:
     max_bytes = settings.max_image_mb * 1024 * 1024
     for f in files:
@@ -101,7 +120,7 @@ def _iter_uploads(files: list[UploadFile], label_texts: dict[str, str], skipped:
                 for info in zf.infolist():
                     if info.is_dir():
                         continue
-                    inner = storage.clean_filename(info.filename)
+                    inner = storage.clean_filename(_zip_entry_name(info))
                     base = PurePosixPath(inner).name
                     if inner.startswith("__MACOSX/") or base.startswith("."):
                         continue
@@ -372,8 +391,7 @@ def save_annotations(
         # 状态类的拒绝用 403，409 专门留给版本冲突，前端据此决定是否重新加载
         if task.status != "active":
             raise HTTPException(403, "任务已结束，不能再修改")
-        if member.status == "submitted":
-            raise HTTPException(403, "你已提交审核，如需修改请先撤回提交")
+        # 待审核（submitted）时允许继续修改：审核员看到的就是最新版本，同时编辑靠版本号防覆盖
         if member.status == "approved":
             raise HTTPException(403, "已审核通过，不能再修改")
     try:
@@ -410,13 +428,85 @@ def mark_done(image_id: int, user: User = Depends(get_current_user), db: Session
     img, task, member = load_image(db, image_id, user)
     if img.assignee_id != user.id:
         raise HTTPException(403, "这张图片没有分配给你")
-    if task.status != "active" or member.status in ("submitted", "approved"):
+    if task.status != "active" or member.status == "approved":
         raise HTTPException(403, "当前状态不能修改")
     if img.status != "done":
         img.status = "done"
         img.done_at = utcnow()
         db.commit()
     return {"version": img.version, "status": img.status, "ann_count": img.ann_count}
+
+
+# ---------------------------------------------------------------- 模型预标注
+
+
+def _require_smart(task: Task) -> None:
+    if task.label_config.get("mode") != "armor":
+        raise HTTPException(400, "只有装甲板模式的任务支持模型预标注")
+    reason = smart.unavailable_reason()
+    if reason:
+        raise HTTPException(503, reason)
+
+
+def _predict(task_id: int, sha1: str, ext: str) -> list[dict[str, Any]]:
+    try:
+        return smart.predict(storage.image_path(task_id, sha1, ext))
+    except smart.SmartUnavailable as e:
+        raise HTTPException(503, str(e)) from e
+
+
+@router.post("/images/{image_id}/smart")
+def smart_image(image_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
+    """只返回预测、不写库：前端放进编辑器（可撤销），由自动保存落库。"""
+    img, task, member = load_image(db, image_id, user)
+    _check_view(db, img, user, is_manager(member))
+    _require_smart(task)
+    task_id, sha1, ext, width, height, classes = img.task_id, img.sha1, img.ext, img.width, img.height, task.classes
+    # 推理期间不占数据库连接
+    db.close()
+    anns, skipped = smart.to_annotations(_predict(task_id, sha1, ext), classes, width, height)
+    return {"annotations": anns, "skipped": skipped}
+
+
+@router.post("/tasks/{task_id}/smart")
+def smart_task(task_id: int, body: SmartIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> dict:
+    """给一批图片写入预标注。只填充还没有标注、也没被确认完成（含确认空图）的图片。"""
+    task, _ = load_task_manager(db, task_id, user)
+    _require_smart(task)
+    ids = list(dict.fromkeys(body.ids))
+    rows = db.execute(
+        select(Image.id, Image.sha1, Image.ext, Image.width, Image.height).where(
+            Image.task_id == task_id, Image.id.in_(ids), Image.ann_count == 0, Image.status != "done"
+        )
+    ).all()
+    classes = task.classes
+    # 结束读事务再推理，几秒的推理期间不占着数据库
+    db.commit()
+
+    filled = boxes = 0
+    for r in rows:
+        anns, _ = smart.to_annotations(_predict(task_id, r.sha1, r.ext), classes, r.width, r.height)
+        if not anns:
+            continue
+        for a in anns:
+            a.pop("conf")
+        # 条件写入：推理期间被人标注过或确认完成的图不覆盖
+        res = db.execute(
+            update(Image)
+            .where(Image.id == r.id, Image.ann_count == 0, Image.status != "done")
+            .values(
+                annotations=anns,
+                ann_count=len(anns),
+                version=Image.version + 1,
+                updated_at=utcnow(),
+                updated_by=user.id,
+            )
+        )
+        if res.rowcount:
+            filled += 1
+            boxes += len(anns)
+    db.commit()
+    return {"filled": filled, "annotations": boxes, "skipped_images": len(ids) - len(rows)}
 
 
 @router.post("/images/{image_id}/flag")

@@ -99,7 +99,15 @@ const example = computed(() => {
       </div>
       <div v-if="opt.fmt !== 'json'" class="field">
         <label>验证集比例：{{ opt.val_ratio }}%</label>
-        <input v-model.number="opt.val_ratio" type="range" min="0" max="50" step="1" style="accent-color: var(--brand)" />
+        <input
+          v-model.number="opt.val_ratio"
+          class="range"
+          type="range"
+          min="0"
+          max="50"
+          step="1"
+          :style="{ '--pct': `${(opt.val_ratio / 50) * 100}%` }"
+        />
         <span class="hint">随机划分（随机种子 {{ opt.seed }}，种子相同则划分结果相同）；0% 时 val 使用训练集</span>
       </div>
       <div class="col" style="gap: 8px">
@@ -169,8 +177,8 @@ const example = computed(() => {
   margin: 0 0 12px;
   padding: 10px 12px;
   border-radius: 6px;
-  background: #0f172a;
-  color: #e2e8f0;
+  background: var(--ink);
+  color: #e8e6dc;
   font-family: var(--mono);
   font-size: 12px;
   white-space: pre-wrap;

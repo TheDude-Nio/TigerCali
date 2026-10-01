@@ -7,9 +7,8 @@ import MarkdownEditor from '../components/MarkdownEditor.vue'
 import { toast } from '../store'
 import type { LabelConfig, Task } from '../types'
 
-const DEFAULT_REQUIREMENTS = `## 标注要求
-
-1. 每个装甲板标 **4 个点**：左灯条上端 → 左灯条下端 → 右灯条下端 → 右灯条上端（即 左上 → 左下 → 右下 → 右上）。
+// 不以「## 标注要求」开头：展示它的卡片已经有同名标题
+const DEFAULT_REQUIREMENTS = `1. 每个装甲板标 **4 个点**：左灯条上端 → 左灯条下端 → 右灯条下端 → 右灯条上端（即 左上 → 左下 → 右下 → 右上）。
    开启「自动规范点序」后点击顺序可以随意，系统会自动整理。
 2. 点要落在 **灯条的端点中心**，放大后再点，尽量精确到像素。
 3. 选择正确的 **颜色** 和 **编号**；熄灭的装甲板选「灰」。

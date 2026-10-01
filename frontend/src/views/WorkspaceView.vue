@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
+import { enhance } from '../annotator/clahe'
 import { cloneAnns } from '../annotator/geometry'
-import { Editor } from '../annotator/editor'
+import { Editor, type ArmorTemplate } from '../annotator/editor'
 import { BitmapCache } from '../annotator/imageCache'
 import { ApiError, api, errMsg } from '../api'
 import MarkdownView from '../components/MarkdownView.vue'
@@ -47,6 +48,8 @@ const annsView = ref<Ann[]>([])
 const view = reactive({ zoom: 100, x: 0, y: 0, inside: false })
 const ui = reactive({
   loupe: localStorage.getItem('tc.loupe') !== '0',
+  template: localStorage.getItem('tc.template') !== '0',
+  clahe: false,
   labels: true,
   lockView: false,
   brightness: 100,
@@ -61,6 +64,67 @@ const canvasEl = ref<HTMLCanvasElement | null>(null)
 let editor: Editor | null = null
 let listRO: ResizeObserver | null = null
 const bitmaps = new BitmapCache(24)
+
+// ---------------------------------------------------------------- 标准装甲板模板（来自 labelRightnow，见 public/armor/LICENSE.txt）
+
+// 4 个标注点（灯条端点：左上、左下、右下、右上）在模板图里的位置；大小装甲由模板图尺寸决定
+const TEMPLATE_BARS: Record<string, Ann['pts']> = {
+  '871x478': [[0, 140.61], [0, 347.39], [871, 347.39], [871, 140.61]],
+  '557x516': [[0, 143.26], [0, 372.74], [557, 372.74], [557, 143.26]],
+}
+const templates = new Map<string, ArmorTemplate | null>()
+
+function loadTemplate(tag: string) {
+  templates.set(tag, null)
+  const img = new Image()
+  img.onload = () => {
+    const w = img.naturalWidth
+    const h = img.naturalHeight
+    const bars = TEMPLATE_BARS[`${w}x${h}`]
+    if (!bars) return
+    // SVG 先栅格化成 2 倍分辨率的位图，之后每帧切三角形贴图时不再重复解析矢量
+    const c = document.createElement('canvas')
+    c.width = w * 2
+    c.height = h * 2
+    c.getContext('2d')!.drawImage(img, 0, 0, c.width, c.height)
+    templates.set(tag, { img: c, w, h, bars })
+    editor?.requestRender()
+  }
+  img.src = `/armor/${encodeURIComponent(tag)}.svg`
+}
+
+function templateOf(c: number): ArmorTemplate | null {
+  if (!isArmor.value) return null
+  const tag = classes.value[c]?.tag
+  if (!tag) return null
+  if (!templates.has(tag)) loadTemplate(tag)
+  return templates.get(tag) ?? null
+}
+
+// ---------------------------------------------------------------- 暗光增强（只影响显示）
+
+const enhanced = new Map<number, Promise<ImageBitmap>>()
+function enhancedBitmap(id: number, src: ImageBitmap): Promise<ImageBitmap> {
+  let p = enhanced.get(id)
+  if (!p) {
+    p = enhance(src)
+    enhanced.set(id, p)
+    // 只留最近几张，旧的释放显存
+    while (enhanced.size > 6) {
+      const [oldId, old] = enhanced.entries().next().value!
+      enhanced.delete(oldId)
+      old.then((b) => b.close()).catch(() => undefined)
+    }
+  }
+  return p
+}
+function clearEnhanced() {
+  for (const p of enhanced.values()) p.then((b) => b.close()).catch(() => undefined)
+  enhanced.clear()
+}
+async function displayBitmap(id: number, src: ImageBitmap): Promise<ImageBitmap> {
+  return ui.clahe ? enhancedBitmap(id, src) : src
+}
 
 interface ImgState {
   d: ImageDetail
@@ -78,13 +142,15 @@ const readonly = computed(() => {
   const t = task.value
   if (!t) return true
   if (mode === 'inspect') return false
-  return t.status !== 'active' || !['labeling', 'rejected'].includes(t.my_status)
+  // 待审核（submitted）时仍可修改：审核员看到的就是最新版本，不必先撤回
+  return t.status !== 'active' || !['labeling', 'rejected', 'submitted'].includes(t.my_status)
 })
-const readonlyReason = computed(() => {
+const submitted = computed(() => mode === 'mine' && task.value?.my_status === 'submitted')
+const statusNote = computed(() => {
   const t = task.value
-  if (!t || !readonly.value) return ''
+  if (!t) return ''
+  if (!readonly.value) return submitted.value ? '已提交审核：审核前仍可修改，改动会实时同步给审核员' : ''
   if (t.status !== 'active') return '任务已结束，只读'
-  if (t.my_status === 'submitted') return '已提交审核，只读（撤回提交后可修改）'
   if (t.my_status === 'approved') return '已审核通过，只读'
   return '只读'
 })
@@ -243,6 +309,11 @@ function prefetch(i: number) {
   const behind = [1, 2].map((d) => list[i - d]?.id).filter((x): x is number => !!x)
   bitmaps.pin([list[i].id, ...ahead, behind[0]].filter((x): x is number => !!x))
   for (const id of [...ahead, behind[0]]) if (id) bitmaps.get(id).catch(() => undefined)
+  // 开着暗光增强时顺手把下一张也增强好，翻页不卡
+  if (ui.clahe && ahead[0]) {
+    const id = ahead[0]
+    bitmaps.get(id).then((b) => enhancedBitmap(id, b)).catch(() => undefined)
+  }
   prefetchDetails([...ahead, ...behind])
 }
 
@@ -257,8 +328,11 @@ async function goto(i: number) {
   const item = list[i]
   const slow = setTimeout(() => token === navToken && (imgLoading.value = true), 150)
   try {
-    const [st, bmp] = await Promise.all([getState(item.id), bitmaps.get(item.id)])
+    const [st, raw] = await Promise.all([getState(item.id), bitmaps.get(item.id)])
     if (token !== navToken) return
+    let bmp = await displayBitmap(item.id, raw)
+    if (token !== navToken) return
+    if (!ui.clahe) bmp = raw // 增强途中被关掉了：增强图可能已释放
     cur.value = st.d
     flagNote.value = st.d.review_note
     editor.setImage(bmp, st.d.width, st.d.height, st.d.annotations, ui.lockView)
@@ -449,6 +523,119 @@ async function copyPrev() {
   toast(`已复制上一张的 ${st.d.annotations.length} 个标注（Ctrl+Z 撤销）`)
 }
 
+function centroid(a: Ann): [number, number] {
+  return [a.pts.reduce((s, p) => s + p[0], 0) / a.pts.length, a.pts.reduce((s, p) => s + p[1], 0) / a.pts.length]
+}
+
+/** 去掉和已有标注重复的候选框（同类别、质心离得很近），避免重复按 I / S 叠出一堆框 */
+function withoutDuplicates(cands: Ann[], existing: Ann[]): Ann[] {
+  return cands.filter((c) => {
+    const [cx, cy] = centroid(c)
+    const diag = Math.hypot(
+      Math.max(...c.pts.map((p) => p[0])) - Math.min(...c.pts.map((p) => p[0])),
+      Math.max(...c.pts.map((p) => p[1])) - Math.min(...c.pts.map((p) => p[1])),
+    )
+    return !existing.some((e) => {
+      if (e.cls !== c.cls) return false
+      const [ex, ey] = centroid(e)
+      return Math.hypot(ex - cx, ey - cy) < Math.max(8, diag * 0.3)
+    })
+  })
+}
+
+/** I：用前后最近的两张已标注图片，按帧间距线性插值出当前图的框（同类别按质心最近配对） */
+async function interpolate() {
+  if (readonly.value || !editor) return
+  const list = items.value
+  const i = shownIdx.value
+  const annCount = (k: number) => states.get(list[k].id)?.d.annotations.length ?? list[k].ann_count
+  let p = -1
+  let n = -1
+  for (let k = i - 1; k >= 0; k--) if (annCount(k) > 0) { p = k; break }
+  for (let k = i + 1; k < list.length; k++) if (annCount(k) > 0) { n = k; break }
+  if (p < 0 || n < 0) {
+    toast('前后都要有已标注的图片才能插值', 'warn')
+    return
+  }
+  const [a, b] = await Promise.all([getState(list[p].id), getState(list[n].id)])
+  if (!editor || shownIdx.value !== i) return
+  const t = (i - p) / (n - p)
+  const used = new Set<number>()
+  const out: Ann[] = []
+  for (const x of a.d.annotations) {
+    const [xc, yc] = centroid(x)
+    let best = -1
+    let bestD = Infinity
+    b.d.annotations.forEach((y, j) => {
+      if (y.cls !== x.cls || used.has(j) || y.pts.length !== x.pts.length) return
+      const [yx, yy] = centroid(y)
+      const d = Math.hypot(yx - xc, yy - yc)
+      if (d < bestD) {
+        bestD = d
+        best = j
+      }
+    })
+    if (best < 0) continue
+    used.add(best)
+    const y = b.d.annotations[best]
+    out.push({ cls: x.cls, pts: x.pts.map((q, k) => [q[0] + (y.pts[k][0] - q[0]) * t, q[1] + (y.pts[k][1] - q[1]) * t]) })
+  }
+  const fresh = withoutDuplicates(out, editor.anns)
+  if (!fresh.length) {
+    toast(out.length ? '插值结果和当前标注重复' : '前后两张没有能配对的同类别框', 'warn')
+    return
+  }
+  editor.appendAnnotations(fresh)
+  toast(`已在第 ${p + 1} 张和第 ${n + 1} 张之间插值出 ${fresh.length} 个框（Ctrl+Z 撤销）`)
+}
+
+// Ctrl+C / Ctrl+V：只复制选中的一个框（C 是整张复制）
+let boxClipboard: Ann | null = null
+function copyBox() {
+  if (!editor || editor.selected < 0) {
+    toast('先选中一个框再按 Ctrl+C')
+    return
+  }
+  boxClipboard = cloneAnns([editor.anns[editor.selected]])[0]
+  toast('已复制选中的框，到其他图片按 Ctrl+V 粘贴', 'info', 1500)
+}
+function pasteBox() {
+  if (readonly.value || !editor) return
+  if (!boxClipboard) {
+    toast('先选中一个框按 Ctrl+C 复制')
+    return
+  }
+  editor.appendAnnotations([boxClipboard])
+  toast('已粘贴 1 个框（Ctrl+Z 撤销）', 'info', 1500)
+}
+
+// S：模型预标当前图（结果进编辑器，可撤销、走自动保存）
+const smartAvailable = computed(() => !!metaStore.meta?.smart_available && isArmor.value)
+const smartBusy = ref(false)
+async function smartLabel() {
+  if (readonly.value || !editor || !smartAvailable.value || smartBusy.value) return
+  const st = currentState()
+  if (!st) return
+  smartBusy.value = true
+  try {
+    const r = await api.post<{ annotations: (Ann & { conf: number })[]; skipped: number }>(`/api/images/${st.d.id}/smart`)
+    if (!editor || currentState() !== st) return
+    const found = r.annotations.map((a) => ({ cls: a.cls, pts: a.pts }))
+    const fresh = withoutDuplicates(found, editor.anns)
+    const skipped = r.skipped ? `，${r.skipped} 个属于未启用的类别已忽略` : ''
+    if (fresh.length) {
+      editor.appendAnnotations(fresh)
+      toast(`模型识别出 ${found.length} 个装甲板，新增 ${fresh.length} 个${skipped}（Ctrl+Z 撤销）`, 'success', 3000)
+    } else {
+      toast(found.length ? `识别结果和现有标注重复${skipped}` : `没有识别到装甲板${skipped}`)
+    }
+  } catch (e) {
+    toast(errMsg(e), 'error')
+  } finally {
+    smartBusy.value = false
+  }
+}
+
 function selectAnn(i: number) {
   editor?.select(i)
 }
@@ -517,7 +704,7 @@ async function submitTask() {
     toast(`还有 ${items.value.length - doneCount.value} 张未完成`, 'warn')
     return
   }
-  if (!(await confirmDialog('提交审核', '提交后等待管理员审核，审核期间不能修改（可以撤回）。'))) return
+  if (!(await confirmDialog('提交审核', '提交后等待管理员审核；审核通过前仍可继续修改。'))) return
   try {
     await api.post(`/api/tasks/${taskId}/submit`)
     toast('已提交，等待审核', 'success')
@@ -580,6 +767,12 @@ function onKeyDown(e: KeyboardEvent) {
       e.preventDefault()
       flush()
       toast('已保存', 'success', 1000)
+    } else if (lower === 'c') {
+      e.preventDefault()
+      copyBox()
+    } else if (lower === 'v') {
+      e.preventDefault()
+      pasteBox()
     }
     return
   }
@@ -631,6 +824,18 @@ function onKeyDown(e: KeyboardEvent) {
       return
     case 'c':
       copyPrev()
+      return
+    case 'i':
+      interpolate()
+      return
+    case 's':
+      smartLabel()
+      return
+    case 't':
+      ui.template = !ui.template
+      return
+    case 'e':
+      ui.clahe = !ui.clahe
       return
     case 'h':
       ui.labels = !ui.labels
@@ -722,6 +927,31 @@ watch(
   },
 )
 watch(
+  () => ui.template,
+  (v) => {
+    if (editor) {
+      editor.showTemplate = v
+      editor.requestRender()
+    }
+    localStorage.setItem('tc.template', v ? '1' : '0')
+  },
+)
+watch(
+  () => ui.clahe,
+  async (on) => {
+    const item = items.value[shownIdx.value]
+    if (editor && item) {
+      const raw = await bitmaps.get(item.id).catch(() => null)
+      // 等待期间可能已经翻页或又切了回去，以最新状态为准
+      if (raw && editor && items.value[shownIdx.value]?.id === item.id && ui.clahe === on) {
+        editor.swapImage(on ? await enhancedBitmap(item.id, raw) : raw)
+      }
+    }
+    // 先把编辑器换回原图再释放增强图，避免画到已 close 的位图；等待期间又打开了就别释放
+    if (!on && !ui.clahe) clearEnhanced()
+  },
+)
+watch(
   () => ui.labels,
   (v) => {
     if (editor) {
@@ -776,6 +1006,7 @@ onMounted(async () => {
     newClass: () => currentCls.value,
     onChange: onEditorChange,
     onSelect: onEditorSelect,
+    templateOf,
     onView: () => {
       if (!editor) return
       view.zoom = Math.round(editor.scale * 100)
@@ -787,6 +1018,7 @@ onMounted(async () => {
   editor.readonly = readonly.value
   editor.autoSort = t.settings.auto_sort
   editor.loupe = ui.loupe
+  editor.showTemplate = ui.template
   onListScroll()
   if (listEl.value) {
     listRO = new ResizeObserver(onListScroll)
@@ -812,6 +1044,7 @@ onBeforeUnmount(() => {
   editor = null
   bitmaps.pin([])
   bitmaps.clear()
+  clearEnhanced()
 })
 
 const helpKeys: [string, string][] = [
@@ -819,12 +1052,16 @@ const helpKeys: [string, string][] = [
   ['拖动点 / 框内拖动', '调整角点 / 整体移动'],
   ['Ctrl + 单击', '在已有框内强制开始画新框'],
   ['滚轮', '以鼠标为中心缩放'],
+  ['右键单击', '撤回上一个点（刚画完的框会退回 3 个点继续画）'],
   ['右键 / 中键拖动、空格+拖动', '平移画面'],
   ['F', '适应窗口'],
   ['D / PageDown', '确认完成并下一张（空图也按 D）'],
   ['A / PageUp', '上一张'],
   ['Shift + D', '跳到下一张未完成'],
   ['C', '复制上一张的标注（视频序列神器）'],
+  ['I', '插值：用前后最近两张已标注图片，按帧距线性插出当前图的框'],
+  ['Ctrl+C / Ctrl+V', '只复制选中的一个框 / 粘贴到当前图'],
+  ['S', '智能预标：模型自动识别当前图的装甲板（服务器配置了模型才有）'],
   ['B R N P', '颜色：蓝 / 红 / 灰 / 紫（选中框时直接修改）'],
   ['0 ~ 8', '编号：0 哨兵 1~5 6 前哨站 7 基地小 8 基地大'],
   ['Tab / Shift+Tab', '切换选中的框'],
@@ -834,6 +1071,8 @@ const helpKeys: [string, string][] = [
   ['Ctrl+Z / Ctrl+Shift+Z', '撤销 / 重做'],
   ['H', '隐藏 / 显示标注'],
   ['Q', '开关放大镜'],
+  ['T', '开关标准装甲板叠加（模板边缘与实物对齐 = 点标准了）'],
+  ['E', '开关暗光增强（CLAHE，只影响显示）'],
   ['L', '锁定视图（切图时保持缩放位置）'],
   ['X', '（审核模式）标记 / 取消标记有问题'],
   ['?', '显示本帮助'],
@@ -866,11 +1105,11 @@ const helpKeys: [string, string][] = [
       <button
         v-if="mode === 'mine' && !readonly"
         class="wbtn primary"
-        :disabled="!allDone"
+        :disabled="!allDone || submitted"
         :title="allDone ? '' : '全部完成后才能提交'"
         @click="submitTask"
       >
-        提交审核
+        {{ submitted ? '已提交，待审核' : '提交审核' }}
       </button>
     </header>
 
@@ -922,7 +1161,7 @@ const helpKeys: [string, string][] = [
       </div>
       <div v-if="imgLoading" class="spinner" />
       <div v-if="cur && cur.flagged && cur.review_note && mode === 'mine'" class="banner">⚑ 审核意见：{{ cur.review_note }}</div>
-      <div v-if="readonlyReason" class="banner ro">{{ readonlyReason }}</div>
+      <div v-if="statusNote" class="banner ro">{{ statusNote }}</div>
     </main>
 
     <!-- 右侧面板 -->
@@ -962,11 +1201,14 @@ const helpKeys: [string, string][] = [
       </section>
 
       <section class="panel">
-        <div class="ph">
-          本图标注 <span class="faint2">{{ annsView.length }} 个</span>
-          <div class="spacer" />
-          <button class="lbtn" :disabled="readonly || shownIdx <= 0" title="C" @click="copyPrev">复制上一张</button>
-          <button class="lbtn danger" :disabled="readonly || !annsView.length" @click="clearAll">清空</button>
+        <div class="ph">本图标注 <span class="faint2">{{ annsView.length }} 个</span></div>
+        <div class="acts">
+          <button class="abtn" :disabled="readonly || shownIdx <= 0" title="复制上一张的全部标注" @click="copyPrev">复制上一张 <kbd>C</kbd></button>
+          <button class="abtn" :disabled="readonly" title="用前后最近两张已标注图片插值" @click="interpolate">插值 <kbd>I</kbd></button>
+          <button v-if="smartAvailable" class="abtn" :disabled="readonly || smartBusy" title="模型自动识别装甲板" @click="smartLabel">
+            {{ smartBusy ? '识别中…' : '智能预标' }} <kbd>S</kbd>
+          </button>
+          <button class="abtn danger" :disabled="readonly || !annsView.length" @click="clearAll">清空</button>
         </div>
         <div class="ann-list">
           <div v-if="!annsView.length" class="faint2" style="padding: 6px 0">没有标注。没有装甲板就直接按 D 确认。</div>
@@ -1004,6 +1246,8 @@ const helpKeys: [string, string][] = [
         <label class="slider">对比度 <input v-model.number="ui.contrast" type="range" min="30" max="300" step="5" /><span class="mono">{{ ui.contrast }}%</span></label>
         <div class="toggles">
           <label><input v-model="ui.loupe" type="checkbox" />放大镜 <kbd>Q</kbd></label>
+          <label v-if="isArmor"><input v-model="ui.template" type="checkbox" />标准装甲板叠加 <kbd>T</kbd></label>
+          <label><input v-model="ui.clahe" type="checkbox" />暗光增强 <kbd>E</kbd></label>
           <label><input v-model="ui.labels" type="checkbox" />显示标注 <kbd>H</kbd></label>
           <label><input v-model="ui.lockView" type="checkbox" />锁定视图 <kbd>L</kbd></label>
         </div>
@@ -1017,7 +1261,7 @@ const helpKeys: [string, string][] = [
       <span v-if="cur" class="mono">{{ cur.width }}×{{ cur.height }}</span>
       <span v-if="view.inside" class="mono">x {{ view.x.toFixed(1) }} · y {{ view.y.toFixed(1) }}</span>
       <div class="spacer" />
-      <span>点 4 下画一个框 · <kbd>D</kbd> 完成并下一张 · <kbd>A</kbd> 上一张 · 滚轮缩放 · 右键拖动 · <kbd>?</kbd> 全部快捷键</span>
+      <span>点 4 下画一个框 · 右键撤回上一个点 · <kbd>D</kbd> 完成并下一张 · <kbd>A</kbd> 上一张 · 滚轮缩放 · 右键拖动平移 · <kbd>?</kbd> 全部快捷键</span>
     </footer>
 
     <!-- 帮助 -->
@@ -1049,11 +1293,11 @@ const helpKeys: [string, string][] = [
 
 <style scoped>
 .ws {
-  --wbg: #0f141c;
-  --wpanel: #151b25;
-  --wborder: #252d3a;
-  --wtext: #d7dde6;
-  --wmuted: #8b95a5;
+  --wbg: #1f1e1d;
+  --wpanel: #262624;
+  --wborder: #3a3935;
+  --wtext: #ecebe6;
+  --wmuted: #a3a199;
   position: fixed;
   inset: 0;
   display: grid;
@@ -1065,9 +1309,9 @@ const helpKeys: [string, string][] = [
   user-select: none;
 }
 .ws kbd {
-  background: #1f2733;
-  border-color: #3a4556;
-  color: #c8d0dc;
+  background: #30302e;
+  border-color: #4a4944;
+  color: #d6d4cc;
   font-size: 11px;
   padding: 0 4px;
   min-width: 16px;
@@ -1093,13 +1337,13 @@ const helpKeys: [string, string][] = [
   padding: 1px 8px;
   border-radius: 999px;
   font-size: 12px;
-  background: #1e3a5f;
-  color: #93c5fd;
+  background: #2a3440;
+  color: #9cc0e4;
   white-space: nowrap;
 }
 .ws-mode.inspect {
-  background: #4a2511;
-  color: #fdba74;
+  background: #4a2e24;
+  color: #f0a588;
 }
 .ws-file {
   display: flex;
@@ -1114,17 +1358,17 @@ const helpKeys: [string, string][] = [
   padding: 0 7px;
   border-radius: 999px;
   font-size: 11px;
-  background: #273142;
-  color: #cbd5e1;
+  background: #353431;
+  color: #d6d4cc;
   white-space: nowrap;
 }
 .wbadge.done {
-  background: #133d27;
-  color: #86efac;
+  background: #2c3622;
+  color: #b5c99a;
 }
 .wbadge.rework {
-  background: #4c1717;
-  color: #fca5a5;
+  background: #4a2522;
+  color: #f2a49b;
 }
 .ws-prog {
   display: flex;
@@ -1137,25 +1381,25 @@ const helpKeys: [string, string][] = [
   width: 110px;
   height: 6px;
   border-radius: 999px;
-  background: #273142;
+  background: #353431;
   overflow: hidden;
 }
 .ws-prog .bar span {
   position: absolute;
   inset: 0 auto 0 0;
-  background: linear-gradient(90deg, #fb923c, #f97316);
+  background: #d97757;
   transition: width 0.2s;
 }
 .ws-save {
-  color: #4ade80;
+  color: #a6c58a;
   font-size: 12px;
   white-space: nowrap;
 }
 .ws-save.dirty {
-  color: #fbbf24;
+  color: #e6b45c;
 }
 .ws-save.err {
-  color: #f87171;
+  color: #ef8a80;
 }
 .wbtn {
   display: inline-flex;
@@ -1163,33 +1407,33 @@ const helpKeys: [string, string][] = [
   gap: 6px;
   height: 28px;
   padding: 0 10px;
-  border: 1px solid #334155;
+  border: 1px solid #45443f;
   border-radius: 6px;
-  background: #1c2430;
+  background: #30302e;
   color: var(--wtext);
   font: inherit;
   cursor: pointer;
   white-space: nowrap;
 }
 .wbtn:hover:not(:disabled) {
-  background: #263041;
+  background: #3a3935;
 }
 .wbtn:disabled {
   opacity: 0.45;
   cursor: not-allowed;
 }
 .wbtn.primary {
-  background: #f97316;
-  border-color: #f97316;
-  color: #fff;
+  background: #d97757;
+  border-color: #d97757;
+  color: #141413;
   font-weight: 600;
 }
 .wbtn.primary:hover:not(:disabled) {
-  background: #ea580c;
+  background: #e2876a;
 }
 .wbtn.danger {
-  border-color: #7f1d1d;
-  color: #fca5a5;
+  border-color: #6e2f2a;
+  color: #f2a49b;
 }
 
 .ws-left {
@@ -1208,7 +1452,7 @@ const helpKeys: [string, string][] = [
 }
 .filters button {
   padding: 2px 8px;
-  border: 1px solid #2d3748;
+  border: 1px solid #3d3c38;
   border-radius: 999px;
   background: transparent;
   color: var(--wmuted);
@@ -1220,9 +1464,9 @@ const helpKeys: [string, string][] = [
   opacity: 0.7;
 }
 .filters button.on {
-  border-color: #f97316;
-  color: #fdba74;
-  background: rgba(249, 115, 22, 0.12);
+  border-color: #d97757;
+  color: #f0a588;
+  background: rgba(217, 119, 87, 0.12);
 }
 .list {
   flex: 1;
@@ -1239,33 +1483,33 @@ const helpKeys: [string, string][] = [
   gap: 6px;
   padding: 0 10px;
   cursor: pointer;
-  color: #aeb8c6;
+  color: #b8b6ae;
 }
 .li:hover {
-  background: #1c2430;
+  background: #30302e;
 }
 .li.on {
-  background: rgba(249, 115, 22, 0.16);
+  background: rgba(217, 119, 87, 0.16);
   color: #fff;
-  box-shadow: inset 3px 0 0 #f97316;
+  box-shadow: inset 3px 0 0 #d97757;
 }
 .dot {
   flex: none;
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #475569;
+  background: #6b6a64;
 }
 .dot.done {
-  background: #22c55e;
+  background: #7fb35c;
 }
 .dot.rework {
-  background: #ef4444;
+  background: #e5604f;
 }
 .li-no {
   flex: none;
   width: 36px;
-  color: #64748b;
+  color: #85837c;
   font-size: 11px;
 }
 .li-name {
@@ -1273,13 +1517,13 @@ const helpKeys: [string, string][] = [
   min-width: 0;
 }
 .li-flag {
-  color: #f87171;
+  color: #ef8a80;
 }
 .li-n {
   flex: none;
   min-width: 14px;
   text-align: right;
-  color: #fdba74;
+  color: #f0a588;
   font-size: 11px;
 }
 .list-empty {
@@ -1319,7 +1563,7 @@ const helpKeys: [string, string][] = [
   height: 36px;
   margin: -18px 0 0 -18px;
   border: 3px solid rgba(255, 255, 255, 0.15);
-  border-top-color: #f97316;
+  border-top-color: #d97757;
   border-radius: 50%;
   animation: spin 0.7s linear infinite;
   pointer-events: none;
@@ -1337,15 +1581,15 @@ const helpKeys: [string, string][] = [
   max-width: 70%;
   padding: 6px 14px;
   border-radius: 8px;
-  background: rgba(127, 29, 29, 0.92);
-  color: #fee2e2;
+  background: rgba(110, 40, 34, 0.92);
+  color: #fbe3df;
   pointer-events: none;
 }
 .banner.ro {
   bottom: auto;
   top: 12px;
-  background: rgba(30, 58, 95, 0.92);
-  color: #dbeafe;
+  background: rgba(42, 52, 64, 0.92);
+  color: #dde8f3;
 }
 
 .ws-right {
@@ -1364,12 +1608,43 @@ const helpKeys: [string, string][] = [
   gap: 6px;
   margin-bottom: 8px;
   font-weight: 600;
-  color: #e5e9f0;
+  color: #ecebe6;
 }
 .faint2 {
   color: var(--wmuted);
   font-size: 12px;
   font-weight: 400;
+}
+.acts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.abtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--wborder);
+  border-radius: 6px;
+  background: #30302e;
+  color: var(--wtext);
+  font: inherit;
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.abtn:hover:not(:disabled) {
+  background: #3a3935;
+}
+.abtn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.abtn.danger {
+  color: #f2a49b;
 }
 .sub {
   margin: 4px 0 4px;
@@ -1396,9 +1671,9 @@ const helpKeys: [string, string][] = [
   gap: 4px;
   height: 30px;
   padding: 0 6px;
-  border: 1px solid #2d3748;
+  border: 1px solid #3d3c38;
   border-radius: 6px;
-  background: #1a212c;
+  background: #2b2a27;
   color: var(--wtext);
   font: inherit;
   font-size: 12px;
@@ -1407,11 +1682,11 @@ const helpKeys: [string, string][] = [
   white-space: nowrap;
 }
 .cbtn:hover {
-  border-color: #475569;
+  border-color: #6b6a64;
 }
 .cbtn.on {
-  border-color: #f97316;
-  background: rgba(249, 115, 22, 0.16);
+  border-color: #d97757;
+  background: rgba(217, 119, 87, 0.16);
   color: #fff;
 }
 .cbtn kbd {
@@ -1439,7 +1714,7 @@ const helpKeys: [string, string][] = [
   margin-top: 10px;
   padding: 6px 8px;
   border-radius: 6px;
-  background: #0f141c;
+  background: #1f1e1d;
 }
 .ann-list {
   max-height: 240px;
@@ -1455,10 +1730,10 @@ const helpKeys: [string, string][] = [
   cursor: pointer;
 }
 .ann:hover {
-  background: #1c2430;
+  background: #30302e;
 }
 .ann.on {
-  background: rgba(249, 115, 22, 0.16);
+  background: rgba(217, 119, 87, 0.16);
 }
 .ann .x {
   border: none;
@@ -1469,12 +1744,12 @@ const helpKeys: [string, string][] = [
   padding: 0 4px;
 }
 .ann .x:hover {
-  color: #f87171;
+  color: #ef8a80;
 }
 .lbtn {
   border: none;
   background: none;
-  color: #93c5fd;
+  color: #9cc0e4;
   font: inherit;
   font-size: 12px;
   cursor: pointer;
@@ -1485,17 +1760,17 @@ const helpKeys: [string, string][] = [
   cursor: not-allowed;
 }
 .lbtn.danger {
-  color: #fca5a5;
+  color: #f2a49b;
 }
 .review {
-  background: rgba(127, 29, 29, 0.12);
+  background: rgba(110, 40, 34, 0.12);
 }
 .note {
   width: 100%;
   padding: 6px 8px;
-  border: 1px solid #334155;
+  border: 1px solid #45443f;
   border-radius: 6px;
-  background: #0f141c;
+  background: #1f1e1d;
   color: var(--wtext);
   font: inherit;
   resize: vertical;
@@ -1510,7 +1785,7 @@ const helpKeys: [string, string][] = [
   color: var(--wmuted);
 }
 .slider input {
-  accent-color: #f97316;
+  accent-color: #d97757;
 }
 .toggles {
   display: flex;
@@ -1525,7 +1800,7 @@ const helpKeys: [string, string][] = [
   cursor: pointer;
 }
 .toggles input {
-  accent-color: #f97316;
+  accent-color: #d97757;
 }
 
 .ws-bottom {
@@ -1562,7 +1837,7 @@ const helpKeys: [string, string][] = [
   user-select: text;
 }
 .ws-dialog.light {
-  background: #fff;
+  background: #faf9f5;
   color: var(--text);
 }
 .ws-dialog.light .ph {

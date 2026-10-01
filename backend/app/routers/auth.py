@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
-from .. import labels
+from .. import labels, smart
 from ..config import settings
 from ..db import get_db, iso, utcnow
 from ..deps import COOKIE_NAME, get_current_user
@@ -81,7 +81,13 @@ def _start_session(db: Session, user: User, response: Response) -> None:
 
 @router.get("/meta")
 def get_meta() -> dict:
-    return {"app_name": "华南虎一起标", "invite_required": bool(settings.invite_code), **labels.meta()}
+    return {
+        "app_name": "华南虎一起标",
+        "invite_required": bool(settings.invite_code),
+        # 前端据此决定是否显示「模型预标注」按钮
+        "smart_available": smart.available(),
+        **labels.meta(),
+    }
 
 
 @router.post("/auth/register")

@@ -180,6 +180,51 @@ function mergeLabels(r: LabelResult) {
 
 const upPct = computed(() => (up.total ? Math.round((up.loaded / up.total) * 100) : 0))
 
+// ---------------------------------------------------------------- 模型预标注
+
+const smartAvailable = computed(() => !!metaStore.meta?.smart_available && props.task.label_config.mode === 'armor')
+const smart = reactive({ running: false, stop: false, done: 0, total: 0, filled: 0, boxes: 0 })
+
+/** 只处理还没有标注、也没被确认完成的图；按 50 张一批调接口，可以随时停 */
+async function smartAll() {
+  const list = await api
+    .get<{ items: { id: number; status: string; ann_count: number }[] }>(`/api/tasks/${props.task.id}/image-list`, {
+      assignee: 'all',
+    })
+    .catch((e) => {
+      toast(errMsg(e), 'error')
+      return null
+    })
+  if (!list) return
+  const ids = list.items.filter((it) => it.ann_count === 0 && it.status !== 'done').map((it) => it.id)
+  if (!ids.length) {
+    toast('没有需要预标注的图片（都已有标注或已确认完成）')
+    return
+  }
+  const ok = await confirmDialog(
+    '模型预标注',
+    `用模型识别 ${ids.length} 张还没有标注的图片，结果作为预标注，标注员只需修正。已有标注、已确认完成的图片不会被改动。`,
+  )
+  if (!ok) return
+  Object.assign(smart, { running: true, stop: false, done: 0, total: ids.length, filled: 0, boxes: 0 })
+  try {
+    for (let i = 0; i < ids.length && !smart.stop; i += 50) {
+      const batch = ids.slice(i, i + 50)
+      const r = await api.post<{ filled: number; annotations: number }>(`/api/tasks/${props.task.id}/smart`, { ids: batch })
+      smart.done += batch.length
+      smart.filled += r.filled
+      smart.boxes += r.annotations
+    }
+    toast(`${smart.stop ? '已停止。' : ''}预标注了 ${smart.filled} 张图片、${smart.boxes} 个装甲板`, 'success', 4000)
+  } catch (e) {
+    toast(errMsg(e), 'error')
+  } finally {
+    smart.running = false
+    load()
+    emit('refresh')
+  }
+}
+
 // ---------------------------------------------------------------- 导入预标注
 
 const importOpen = ref(false)
@@ -325,7 +370,8 @@ function open(img: ImageDetail) {
         <div class="row mt-16" style="justify-content: center">
           <button class="btn" :disabled="up.running" @click="fileInput?.click()">选择图片 / zip</button>
           <button class="btn" :disabled="up.running" @click="dirInput?.click()">选择文件夹</button>
-          <button class="btn btn-ghost" @click="importOpen = !importOpen">导入预标注…</button>
+          <button class="btn" :class="{ 'btn-on': importOpen }" @click="importOpen = !importOpen">导入预标注…</button>
+          <button v-if="smartAvailable" class="btn" :disabled="smart.running || up.running" @click="smartAll">模型预标注</button>
         </div>
         <input ref="fileInput" type="file" multiple accept="image/*,.zip,.txt" hidden @change="onPick" />
         <input ref="dirInput" type="file" webkitdirectory multiple hidden @change="onPick" />
@@ -347,6 +393,17 @@ function open(img: ImageDetail) {
             <div v-for="(er, i) in up.errors" :key="i">{{ er }}</div>
           </div>
         </details>
+      </div>
+
+      <div v-if="smart.running" class="up-status mt-16">
+        <div class="row">
+          <b>模型预标注中…</b>
+          <span class="muted">{{ smart.done }} / {{ smart.total }} 张</span>
+          <div class="spacer" />
+          <span>已填充 <b>{{ smart.filled }}</b> 张、{{ smart.boxes }} 个框</span>
+          <button class="btn btn-sm" :disabled="smart.stop" @click="smart.stop = true">{{ smart.stop ? '正在停止…' : '停止' }}</button>
+        </div>
+        <div class="progress mt-8"><span :style="{ width: (smart.total ? (smart.done / smart.total) * 100 : 0) + '%' }" /></div>
       </div>
 
       <div v-if="importOpen" class="import mt-16">
@@ -441,7 +498,7 @@ function open(img: ImageDetail) {
   padding: 28px 16px;
   border: 2px dashed var(--border-strong);
   border-radius: 12px;
-  background: #fafbfc;
+  background: var(--panel-2);
   text-align: center;
   transition: all 0.12s;
 }
@@ -468,7 +525,7 @@ function open(img: ImageDetail) {
   padding: 14px;
   border: 1px solid var(--border);
   border-radius: 8px;
-  background: #fafbfc;
+  background: var(--panel-2);
 }
 .sel {
   position: absolute;
@@ -480,7 +537,7 @@ function open(img: ImageDetail) {
   width: 24px;
   height: 24px;
   border-radius: 4px;
-  background: rgba(255, 255, 255, 0.9);
+  background: rgba(255, 255, 255, 0.92);
   cursor: pointer;
   opacity: 0;
   transition: opacity 0.1s;

@@ -3,6 +3,8 @@ import os
 
 import uvicorn
 
+from .config import settings
+
 if __name__ == "__main__":
     uvicorn.run(
         "app.main:app",
@@ -10,5 +12,5 @@ if __name__ == "__main__":
         port=int(os.environ.get("TIGERCALI_PORT", "8000")),
         workers=int(os.environ.get("TIGERCALI_WORKERS", "1")),
         proxy_headers=True,
-        forwarded_allow_ips="*",
+        forwarded_allow_ips=settings.forwarded_allow_ips,
     )

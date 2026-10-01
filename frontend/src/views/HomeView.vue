@@ -21,6 +21,8 @@ onMounted(async () => {
 
 const labelTasks = computed(() => tasks.value.filter((t) => t.my_assigned > 0 || !t.is_manager))
 const managedTasks = computed(() => tasks.value.filter((t) => t.is_manager))
+// 只管理、不标注的人：把「我管理的任务」放到最上面，空的「我的标注」压缩成一行
+const managedFirst = computed(() => !labelTasks.value.length && managedTasks.value.length > 0)
 </script>
 
 <template>
@@ -35,10 +37,11 @@ const managedTasks = computed(() => tasks.value.filter((t) => t.is_manager))
     </div>
 
     <div v-if="loading" class="empty">加载中…</div>
-    <template v-else>
-      <section class="sec">
+    <div v-else class="secs" :class="{ 'managed-first': managedFirst }">
+      <section class="sec sec-label">
         <h2 class="sec-title">我的标注 <span class="faint">{{ labelTasks.length }}</span></h2>
-        <div v-if="!labelTasks.length" class="card empty">
+        <div v-if="managedFirst" class="card compact-empty faint">还没有分配给你的标注任务</div>
+        <div v-else-if="!labelTasks.length" class="card empty">
           <div class="big">🐯</div>
           还没有分配给你的标注任务。管理员把你加入任务并分配图片后会出现在这里。
         </div>
@@ -74,7 +77,7 @@ const managedTasks = computed(() => tasks.value.filter((t) => t.is_manager))
           <router-link v-for="t in managedTasks" :key="t.id" :to="`/tasks/${t.id}`" class="tcard">
             <div class="tcard-head">
               <span class="tname ellipsis">{{ t.name }}</span>
-              <span class="badge" :class="t.status === 'finished' ? 'badge-green' : 'badge-blue'">
+              <span class="badge dot" :class="t.status === 'finished' ? 'badge-green' : 'badge-blue'">
                 {{ t.status === 'finished' ? '已结束' : '进行中' }}
               </span>
             </div>
@@ -87,16 +90,25 @@ const managedTasks = computed(() => tasks.value.filter((t) => t.is_manager))
           </router-link>
         </div>
       </section>
-    </template>
+    </div>
   </div>
 </template>
 
 <style scoped>
-.sec + .sec {
-  margin-top: 32px;
+.secs {
+  display: flex;
+  flex-direction: column;
+  gap: 32px;
+}
+.managed-first .sec-label {
+  order: 1;
+}
+.compact-empty {
+  padding: 14px 18px;
+  font-size: 13px;
 }
 .sec-title {
-  font-size: 16px;
+  font-size: 20px;
   margin-bottom: 12px;
 }
 .cards {
@@ -109,7 +121,7 @@ const managedTasks = computed(() => tasks.value.filter((t) => t.is_manager))
   padding: 16px 18px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  background: #fff;
+  background: var(--panel);
   color: var(--text);
   box-shadow: var(--shadow);
   transition:
@@ -119,9 +131,9 @@ const managedTasks = computed(() => tasks.value.filter((t) => t.is_manager))
 }
 .tcard:hover {
   text-decoration: none;
-  border-color: var(--brand);
+  border-color: var(--ink);
   transform: translateY(-1px);
-  box-shadow: 0 6px 16px rgba(16, 24, 40, 0.08);
+  box-shadow: 0 6px 16px rgba(20, 20, 19, 0.08);
 }
 .tcard-head {
   display: flex;

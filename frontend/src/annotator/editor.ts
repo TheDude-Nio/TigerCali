@@ -5,7 +5,15 @@
  * 屏幕坐标 = 图像坐标 * scale + (ox, oy)。
  */
 import type { Ann, Point } from '../types'
-import { cloneAnns, hexA, pointInPoly, polyArea, sortPoints } from './geometry'
+import { affine3, applyH, cloneAnns, hexA, homography, pointInPoly, polyArea, sortPoints } from './geometry'
+
+/** 标准装甲板模板：img 为模板图，bars 为 4 个标注点（灯条端点，左上、左下、右下、右上）在模板图里的位置 */
+export interface ArmorTemplate {
+  img: CanvasImageSource
+  w: number
+  h: number
+  bars: Point[]
+}
 
 export interface EditorHooks {
   styleOf(cls: number): { color: string; label: string }
@@ -13,10 +21,12 @@ export interface EditorHooks {
   onChange(anns: Ann[]): void
   onSelect(index: number): void
   onView?(): void
+  /** 该类别对应的标准装甲板模板（还没加载好或不是装甲板时返回 null） */
+  templateOf?(cls: number): ArmorTemplate | null
 }
 
 type Drag =
-  | { kind: 'pan'; sx: number; sy: number; ox: number; oy: number }
+  | { kind: 'pan'; sx: number; sy: number; ox: number; oy: number; button: number; moved: boolean }
   | { kind: 'vertex'; ann: number; v: number; moved: boolean; snapshot: string; sx: number; sy: number }
   | { kind: 'move'; ann: number; start: Point; orig: Point[]; moved: boolean; snapshot: string; sx: number; sy: number }
 
@@ -54,12 +64,15 @@ export class Editor {
   readonly = false
   autoSort = true
   showLabels = true
+  showTemplate = true
   loupe = true
   brightness = 1
   contrast = 1
 
   private undoStack: string[] = []
   private redoStack: string[] = []
+  /** 刚用第 4 次点击画完的框：右键可以把它退回到 3 个点继续画。after 不再等于当前快照就失效 */
+  private justCompleted: { clicks: Point[]; after: string } | null = null
   private raf = 0
   private ro: ResizeObserver
   private listeners: [EventTarget, string, EventListener, AddEventListenerOptions?][] = []
@@ -111,9 +124,16 @@ export class Editor {
     this.drag = null
     this.undoStack = []
     this.redoStack = []
+    this.justCompleted = null
     if (!(keepView && sameSize) || this.fitted) this.fit()
     this.updateMouseImage()
     this.hooks.onSelect(-1)
+    this.requestRender()
+  }
+
+  /** 只换显示用的位图（同一张图的增强版 / 原版），保留标注、视图和撤销历史 */
+  swapImage(img: CanvasImageSource) {
+    this.img = img
     this.requestRender()
   }
 
@@ -122,6 +142,15 @@ export class Editor {
     this.pushUndo(this.snapshot())
     this.anns = cloneAnns(anns)
     this.select(-1)
+    this.emitChange()
+  }
+
+  /** 追加若干个框（粘贴、插值、模型预标），可撤销；坐标裁剪到图内 */
+  appendAnnotations(anns: Ann[]) {
+    if (this.readonly || !anns.length) return
+    this.pushUndo(this.snapshot())
+    for (const a of anns) this.anns.push({ cls: a.cls, pts: a.pts.map((p) => this.clampPt(p[0], p[1])) })
+    this.select(this.anns.length - 1)
     this.emitChange()
   }
 
@@ -186,6 +215,27 @@ export class Editor {
     if (next === undefined) return
     this.undoStack.push(this.snapshot())
     this.anns = JSON.parse(next)
+    this.select(-1)
+    this.emitChange()
+  }
+
+  /** 右键单击：撤回上一次点的点。画到一半时去掉最后一个点；刚画完的框退回 3 个点继续画 */
+  undoLastPoint() {
+    if (this.readonly) return
+    if (this.drawing) {
+      this.drawing.pop()
+      if (!this.drawing.length) this.drawing = null
+      this.requestRender()
+      return
+    }
+    const jc = this.justCompleted
+    this.justCompleted = null
+    // 画完之后又做过别的修改（拖点、改类别、删框……）就不再回退，避免误删
+    if (!jc || jc.after !== this.snapshot()) return
+    const before = this.undoStack.pop()
+    if (before === undefined) return
+    this.anns = JSON.parse(before)
+    this.drawing = jc.clicks.slice(0, 3)
     this.select(-1)
     this.emitChange()
   }
@@ -390,7 +440,7 @@ export class Editor {
     this.mouse.sy = sy
     this.updateMouseImage()
     if (e.button === 1 || e.button === 2 || (e.button === 0 && this.space)) {
-      this.drag = { kind: 'pan', sx, sy, ox: this.ox, oy: this.oy }
+      this.drag = { kind: 'pan', sx, sy, ox: this.ox, oy: this.oy, button: e.button, moved: false }
       this.canvas.setPointerCapture(e.pointerId)
       this.updateCursor()
       e.preventDefault()
@@ -463,6 +513,8 @@ export class Editor {
       this.pushUndo(this.snapshot())
       this.anns.push({ cls: this.hooks.newClass(), pts })
       this.select(this.anns.length - 1)
+      // 记下原始点击顺序（自动规范点序会重排 pts），右键回退时按点击顺序还原
+      this.justCompleted = { clicks: d.slice(), after: this.snapshot() }
       this.emitChange()
     } else {
       this.requestRender()
@@ -477,6 +529,8 @@ export class Editor {
     this.updateMouseImage()
     const d = this.drag
     if (d?.kind === 'pan') {
+      if (!d.moved && Math.hypot(sx - d.sx, sy - d.sy) < 4) return
+      d.moved = true
       this.ox = d.ox + (sx - d.sx)
       this.oy = d.oy + (sy - d.sy)
       this.fitted = false
@@ -502,7 +556,10 @@ export class Editor {
     const d = this.drag
     this.drag = null
     if (this.canvas.hasPointerCapture(e.pointerId)) this.canvas.releasePointerCapture(e.pointerId)
-    if (d?.kind === 'vertex' && d.moved) {
+    // 右键按下又原地松开 = 单击（拖动过才算平移）
+    if (d?.kind === 'pan' && d.button === 2 && !d.moved) {
+      this.undoLastPoint()
+    } else if (d?.kind === 'vertex' && d.moved) {
       const a = this.anns[d.ann]
       if (this.autoSort) {
         const moved = a.pts[d.v]
@@ -547,7 +604,7 @@ export class Editor {
   private render() {
     const ctx = this.ctx
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0)
-    ctx.fillStyle = '#0b0f17'
+    ctx.fillStyle = '#181716'
     ctx.fillRect(0, 0, this.cw, this.ch)
     if (!this.img) return
 
@@ -559,6 +616,12 @@ export class Editor {
     ctx.restore()
 
     const toS = (p: Point) => this.toScreen(p)
+    if (this.showTemplate && this.hooks.templateOf) {
+      for (let i = 0; i < this.anns.length; i++) {
+        if (!this.showLabels && i !== this.selected) continue
+        this.drawTemplate(ctx, this.anns[i], toS)
+      }
+    }
     for (let i = 0; i < this.anns.length; i++) {
       if (!this.showLabels && i !== this.selected) continue
       this.drawAnn(ctx, this.anns[i], toS, i === this.selected, i === this.hoverAnn, true)
@@ -580,6 +643,64 @@ export class Editor {
       ctx.restore()
       if (this.loupe && m.ix >= -2 && m.iy >= -2 && m.ix <= this.iw + 2 && m.iy <= this.ih + 2) this.drawLoupe(ctx)
     }
+  }
+
+  /**
+   * 把标准装甲板模板按 4 个标注点透视叠加到图上：模板边缘与实物边缘重合，说明点标准了。
+   * Canvas 2D 只有仿射变换，所以把模板切成 n×n 网格、每个三角形用仿射近似透视（三角形越小越准）；
+   * n 随框在屏幕上的大小变化，小框少切几刀，省得每次重绘都画几百个三角形。
+   */
+  private drawTemplate(ctx: CanvasRenderingContext2D, a: Ann, toS: (p: Point) => Point) {
+    const t = this.hooks.templateOf!(a.cls)
+    if (!t || a.pts.length !== 4) return
+    const dst = a.pts.map(toS)
+    const h = homography(t.bars, dst)
+    if (!h) return
+    const size = Math.max(...dst.map((p, i) => Math.hypot(p[0] - dst[(i + 1) % 4][0], p[1] - dst[(i + 1) % 4][1])))
+    const n = Math.min(8, Math.max(2, Math.ceil(size / 50)))
+    const grid: Point[][] = []
+    for (let j = 0; j <= n; j++) {
+      grid.push([])
+      for (let i = 0; i <= n; i++) grid[j].push(applyH(h, (t.w * i) / n, (t.h * j) / n))
+    }
+    ctx.save()
+    ctx.globalAlpha = 0.5
+    ctx.imageSmoothingEnabled = true
+    for (let j = 0; j < n; j++) {
+      for (let i = 0; i < n; i++) {
+        const u0 = (t.w * i) / n, u1 = (t.w * (i + 1)) / n
+        const v0 = (t.h * j) / n, v1 = (t.h * (j + 1)) / n
+        this.drawTri(ctx, t, [[u0, v0], [u1, v0], [u1, v1]], [grid[j][i], grid[j][i + 1], grid[j + 1][i + 1]])
+        this.drawTri(ctx, t, [[u0, v0], [u1, v1], [u0, v1]], [grid[j][i], grid[j + 1][i + 1], grid[j + 1][i]])
+      }
+    }
+    ctx.restore()
+  }
+
+  private drawTri(ctx: CanvasRenderingContext2D, t: ArmorTemplate, s: Point[], d: Point[]) {
+    const m = affine3(s, d)
+    if (!m) return
+    // 裁剪三角形向外扩 0.6px，盖住相邻三角形之间抗锯齿留下的细缝
+    const cx = (d[0][0] + d[1][0] + d[2][0]) / 3
+    const cy = (d[0][1] + d[1][1] + d[2][1]) / 3
+    ctx.save()
+    ctx.beginPath()
+    for (let k = 0; k < 3; k++) {
+      const dx = d[k][0] - cx
+      const dy = d[k][1] - cy
+      const len = Math.hypot(dx, dy) || 1
+      const x = d[k][0] + (dx / len) * 0.6
+      const y = d[k][1] + (dy / len) * 0.6
+      if (k === 0) ctx.moveTo(x, y)
+      else ctx.lineTo(x, y)
+    }
+    ctx.closePath()
+    ctx.clip()
+    const r = this.dpr
+    ctx.setTransform(r * m[0], r * m[1], r * m[2], r * m[3], r * m[4], r * m[5])
+    // 模板图可能按更高分辨率栅格化，统一缩放到模板坐标 w×h
+    ctx.drawImage(t.img, 0, 0, t.w, t.h)
+    ctx.restore()
   }
 
   private drawAnn(
@@ -731,7 +852,7 @@ export class Editor {
     ctx.restore()
 
     ctx.save()
-    ctx.strokeStyle = '#f97316'
+    ctx.strokeStyle = '#d97757'
     ctx.lineWidth = 2
     ctx.strokeRect(x0, y0, size, size)
     ctx.fillStyle = 'rgba(0,0,0,0.65)'

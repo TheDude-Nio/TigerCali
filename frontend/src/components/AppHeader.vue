@@ -105,8 +105,8 @@ async function saveAccount() {
   position: sticky;
   top: 0;
   z-index: 100;
-  background: rgba(255, 255, 255, 0.92);
-  backdrop-filter: saturate(180%) blur(8px);
+  background: rgba(250, 249, 245, 0.9);
+  backdrop-filter: saturate(140%) blur(8px);
   border-bottom: 1px solid var(--border);
 }
 .hdr-in {
@@ -123,9 +123,9 @@ async function saveAccount() {
   align-items: center;
   gap: 10px;
   color: var(--text);
-  font-size: 17px;
-  font-weight: 700;
-  letter-spacing: 0.5px;
+  font-family: var(--font-serif);
+  font-size: 18px;
+  font-weight: 600;
 }
 .logo:hover {
   text-decoration: none;
@@ -140,17 +140,17 @@ async function saveAccount() {
 }
 .nav-a {
   padding: 6px 12px;
-  border-radius: 6px;
+  border-radius: 8px;
   color: var(--text-2);
-  font-weight: 550;
+  font-weight: 500;
 }
 .nav-a:hover {
-  background: #f3f4f6;
+  background: var(--hover);
   text-decoration: none;
 }
 .nav-a.router-link-exact-active {
-  color: var(--brand-600);
-  background: var(--brand-50);
+  color: var(--text);
+  background: var(--hover);
 }
 .user {
   position: relative;
@@ -167,7 +167,7 @@ async function saveAccount() {
   font: inherit;
 }
 .user-btn:hover {
-  background: #f3f4f6;
+  background: var(--hover);
 }
 .avatar {
   display: grid;
@@ -177,7 +177,7 @@ async function saveAccount() {
   border-radius: 50%;
   background: var(--brand);
   color: #fff;
-  font-weight: 700;
+  font-weight: 600;
   font-size: 13px;
 }
 .user-name {
@@ -195,7 +195,7 @@ async function saveAccount() {
   padding: 6px;
   border: 1px solid var(--border);
   border-radius: 8px;
-  background: #fff;
+  background: var(--panel);
   box-shadow: var(--shadow-lg);
 }
 .menu button {
@@ -210,7 +210,7 @@ async function saveAccount() {
   cursor: pointer;
 }
 .menu button:hover {
-  background: #f3f4f6;
+  background: var(--hover);
 }
 .menu .danger {
   color: var(--red);

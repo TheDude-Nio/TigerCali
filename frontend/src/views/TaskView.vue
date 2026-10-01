@@ -88,7 +88,7 @@ function setTab(key: TabKey) {
         <div class="col" style="gap: 4px; min-width: 0">
           <div class="row">
             <h1 class="ellipsis">{{ task.name }}</h1>
-            <span class="badge" :class="task.status === 'finished' ? 'badge-green' : 'badge-blue'">
+            <span class="badge dot" :class="task.status === 'finished' ? 'badge-green' : 'badge-blue'">
               {{ task.status === 'finished' ? '已结束' : '进行中' }}
             </span>
             <span class="badge badge-gray">{{ ROLE_TEXT[task.my_role] }}</span>

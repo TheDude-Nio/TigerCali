@@ -104,6 +104,6 @@ function onPick(e: Event) {
   padding: 12px 14px;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
-  background: #fff;
+  background: var(--panel);
 }
 </style>

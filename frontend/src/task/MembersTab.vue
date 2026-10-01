@@ -382,7 +382,7 @@ async function doAssign() {
   border-bottom: none;
 }
 .user-row:hover {
-  background: #fafbfc;
+  background: var(--panel-2);
 }
 .user-row.on {
   background: var(--brand-50);

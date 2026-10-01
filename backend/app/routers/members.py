@@ -125,7 +125,8 @@ def _split_counts(n: int, body: AssignIn) -> list[int]:
         raise HTTPException(400, "比例总和不能超过 100%")
     exact = [n * r / 100 for r in ratios]
     counts = [math.floor(x) for x in exact]
-    target = min(n, round(sum(exact)))
+    # 四舍五入要和前端预览的 Math.round 一致；Python 的 round 是银行家舍入（12.5→12），会比预览少 1 张
+    target = min(n, math.floor(sum(exact) + 0.5))
     # 最大余数法补齐
     for i in sorted(range(k), key=lambda i: exact[i] - counts[i], reverse=True)[: max(0, target - sum(counts))]:
         counts[i] += 1

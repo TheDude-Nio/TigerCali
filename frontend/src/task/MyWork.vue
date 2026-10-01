@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import { api, errMsg } from '../api'
 import MarkdownView from '../components/MarkdownView.vue'
 import ProgressBar from '../components/ProgressBar.vue'
+import StatCard from '../components/StatCard.vue'
 import { confirmDialog, toast } from '../store'
 import type { MyProgress, Task } from '../types'
 import { MEMBER_STATUS, classColor, fmtTime, pct } from '../utils'
@@ -25,8 +26,10 @@ async function load() {
 onMounted(load)
 
 const allDone = computed(() => !!prog.value && prog.value.assigned > 0 && prog.value.done === prog.value.assigned)
+// 待审核时也能改：审核员看到的就是最新版本
 const canEdit = computed(
-  () => props.task.status === 'active' && !!prog.value && ['labeling', 'rejected'].includes(prog.value.status),
+  () =>
+    props.task.status === 'active' && !!prog.value && ['labeling', 'rejected', 'submitted'].includes(prog.value.status),
 )
 
 function start(filter?: string) {
@@ -34,7 +37,7 @@ function start(filter?: string) {
 }
 
 async function submit() {
-  if (!(await confirmDialog('提交审核', '提交后需要等待管理员审核，审核期间不能修改（可以撤回）。确定提交吗？'))) return
+  if (!(await confirmDialog('提交审核', '提交后等待管理员审核；审核通过前仍可继续修改。确定提交吗？'))) return
   busy.value = true
   try {
     await api.post(`/api/tasks/${props.task.id}/submit`)
@@ -52,7 +55,7 @@ async function withdraw() {
   busy.value = true
   try {
     await api.post(`/api/tasks/${props.task.id}/withdraw`)
-    toast('已撤回，可以继续修改', 'success')
+    toast('已撤回提交', 'success')
     await load()
     emit('refresh')
   } catch (e) {
@@ -81,7 +84,7 @@ async function withdraw() {
           <div v-if="prog.rework" class="mt-8">有 <b>{{ prog.rework }}</b> 张图片被标记为需要返工。</div>
         </div>
         <div v-else-if="prog.status === 'submitted'" class="notice notice-info mb-16">
-          已于 {{ fmtTime(prog.submitted_at) }} 提交，等待管理员审核。审核期间不能修改，如需修改请先撤回。
+          已于 {{ fmtTime(prog.submitted_at) }} 提交，等待管理员审核。审核通过前仍可继续修改，改动会实时同步给审核员。
         </div>
         <div v-else-if="prog.status === 'approved'" class="notice notice-ok mb-16">
           审核已通过 🎉 {{ prog.review_comment ? `审核意见：${prog.review_comment}` : '' }}
@@ -90,17 +93,14 @@ async function withdraw() {
         <template v-if="prog.assigned > 0">
           <ProgressBar :value="prog.done" :total="prog.assigned" :green="allDone" label />
           <div class="grid-4 mt-16">
-            <div class="stat"><div class="num">{{ prog.assigned }}</div><div class="lbl">分配给我</div></div>
-            <div class="stat"><div class="num">{{ prog.done }}</div><div class="lbl">已完成 {{ pct(prog.done, prog.assigned) }}%</div></div>
-            <div class="stat"><div class="num">{{ prog.todo }}</div><div class="lbl">未完成</div></div>
-            <div class="stat">
-              <div class="num" :style="{ color: prog.rework ? 'var(--red)' : '' }">{{ prog.rework }}</div>
-              <div class="lbl">需返工</div>
-            </div>
+            <StatCard icon="user" tone="blue" :value="prog.assigned" label="分配给我" />
+            <StatCard icon="check" tone="green" :value="prog.done" :label="`已完成 ${pct(prog.done, prog.assigned)}%`" />
+            <StatCard icon="clock" :tone="prog.todo ? 'brand' : 'gray'" :value="prog.todo" label="未完成" />
+            <StatCard icon="redo" :tone="prog.rework ? 'red' : 'gray'" :value="prog.rework" label="需返工" />
           </div>
           <div class="row mt-24">
             <button class="btn btn-primary btn-lg" @click="start()">
-              {{ !canEdit ? '查看我的标注' : prog.done === 0 ? '开始标注' : '继续标注' }}
+              {{ !canEdit ? '查看我的标注' : prog.status === 'submitted' ? '修改标注' : prog.done === 0 ? '开始标注' : '继续标注' }}
             </button>
             <button v-if="prog.rework && canEdit" class="btn btn-lg btn-danger" @click="start('rework')">
               只看需返工的 {{ prog.rework }} 张

@@ -178,9 +178,15 @@ def test_full_flow(world: dict) -> None:
     assert prog["done"] == 4 and prog["done_today"] == 4
 
     assert alice.post(f"/api/tasks/{tid}/submit").status_code == 200
-    # 提交后不能再改，除非撤回
-    r = alice.put(f"/api/images/{mine[0]['id']}/annotations", json={"annotations": [], "version": det["version"]})
-    assert r.status_code == 403
+    # 待审核时仍可修改：保存成功、图片仍是已完成、成员仍是待审核
+    cur = alice.get(f"/api/images/{mine[0]['id']}").json()
+    r = alice.put(
+        f"/api/images/{mine[0]['id']}/annotations",
+        json={"annotations": cur["annotations"], "version": cur["version"]},
+    )
+    assert r.status_code == 200 and r.json()["status"] == "done"
+    assert alice.post(f"/api/images/{mine[0]['id']}/done").status_code == 200
+    assert alice.get(f"/api/tasks/{tid}/my-progress").json()["status"] == "submitted"
 
     # 管理员标记一张有问题并打回
     r = admin.post(f"/api/images/{mine[1]['id']}/flag", json={"flagged": True, "note": "左上点偏了"})
@@ -195,6 +201,14 @@ def test_full_flow(world: dict) -> None:
     assert alice.post(f"/api/tasks/{tid}/submit").status_code == 200
     r = admin.post(f"/api/tasks/{tid}/members/{ids['alice']}/review", json={"action": "approve"})
     assert r.json() == {"status": "approved", "task_finished": False}
+    # 审核通过后才锁定
+    cur = alice.get(f"/api/images/{mine[0]['id']}").json()
+    r = alice.put(
+        f"/api/images/{mine[0]['id']}/annotations",
+        json={"annotations": cur["annotations"], "version": cur["version"]},
+    )
+    assert r.status_code == 403
+    assert alice.post(f"/api/images/{mine[0]['id']}/done").status_code == 403
 
     # bob 完成：用 done 接口确认空图
     for it in bob.get(f"/api/tasks/{tid}/image-list").json()["items"]:
@@ -362,3 +376,132 @@ def test_review_regressions(world: dict) -> None:
     admin.patch(f"/api/tasks/{tid}", json={"label_config": {"mode": "armor", "colors": ["B"], "tags": ["G", "1", "3"]}})
     r = alice.put(f"/api/images/{a_img}/annotations", json={"annotations": [{"cls": 1, "pts": [[1, 1], [1, 5], [9, 5], [9, 1]]}], "version": v0})
     assert r.status_code == 409
+
+
+# ---------------------------------------------------------------- 回归：API 核查发现的问题
+
+
+def _proxied_client(peer: str) -> TestClient:
+    """与 python -m app 相同的代理头处理：uvicorn 用 settings.forwarded_allow_ips 包一层 ProxyHeadersMiddleware。"""
+    from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+    from app.config import settings
+
+    return TestClient(ProxyHeadersMiddleware(app, trusted_hosts=settings.forwarded_allow_ips), client=(peer, 40000))
+
+
+def test_main_trusts_only_configured_proxies(monkeypatch: pytest.MonkeyPatch) -> None:
+    import runpy
+
+    import uvicorn
+
+    from app.config import settings
+
+    seen: dict = {}
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: seen.update(kw))
+    runpy.run_module("app", run_name="__main__")
+    assert seen["proxy_headers"] is True
+    assert seen["forwarded_allow_ips"] == settings.forwarded_allow_ips == "127.0.0.1,::1"
+
+
+def test_forged_forwarded_for_cannot_bypass_login_limit() -> None:
+    client_for("xff_victim")
+    attacker = _proxied_client("203.0.113.9")
+    for i in range(10):
+        r = attacker.post(
+            "/api/auth/login", json={"username": "xff_victim", "password": "wrong!"}, headers={"X-Forwarded-For": f"10.0.{i}.1"}
+        )
+        assert r.status_code == 400
+    r = attacker.post(
+        "/api/auth/login", json={"username": "xff_victim", "password": "secret123"}, headers={"X-Forwarded-For": "10.0.99.1"}
+    )
+    assert r.status_code == 429
+
+
+def test_trusted_proxy_limits_by_real_client_ip() -> None:
+    client_for("xff_proxied")
+    nginx = _proxied_client("127.0.0.1")
+    login = lambda pw, xff: nginx.post(  # noqa: E731
+        "/api/auth/login", json={"username": "xff_proxied", "password": pw}, headers={"X-Forwarded-For": xff}
+    )
+    # nginx 把真实 IP 追加在最右边，左边是客户端自己填的
+    for i in range(10):
+        assert login("wrong!", f"1.1.1.{i}, 198.51.100.7").status_code == 400
+    assert login("secret123", "2.2.2.2, 198.51.100.7").status_code == 429
+    # 其他真实客户端不受影响
+    assert login("secret123", "198.51.100.8").status_code == 200
+
+
+def test_ratio_split_rounds_like_frontend() -> None:
+    from app.routers.members import AssignEntry, AssignIn, _split_counts
+
+    def split(n: int, *ratios: float) -> list[int]:
+        return _split_counts(n, AssignIn(mode="ratio", entries=[AssignEntry(user_id=i, value=r) for i, r in enumerate(ratios)]))
+
+    # 前端 Math.round(12.5) = 13；Python round(12.5) = 12
+    assert split(25, 50) == [13]
+    assert split(5, 50) == [3]
+    assert split(25, 50, 50) == [13, 12]
+    assert sum(split(7, 100 / 3, 100 / 3, 100 / 3)) == 7
+    assert split(4, 30) == [1]
+
+
+def test_gbk_zip_filenames(world: dict) -> None:
+    admin = world["admin"]
+    tid = admin.post("/api/tasks", json={"name": "gbk", "label_config": ARMOR}).json()["id"]
+
+    class GbkInfo(zipfile.ZipInfo):
+        # 模拟 Windows 中文系统的压缩软件：文件名按 GBK 写入，不设 UTF-8 标志位
+        def _encodeFilenameFlags(self) -> tuple[bytes, int]:
+            return self.filename.encode("gbk"), self.flag_bits & ~0x800
+
+    zbuf = io.BytesIO()
+    with zipfile.ZipFile(zbuf, "w") as zf:
+        zf.writestr(GbkInfo("红方/帧1.jpg"), jpeg((7, 77, 177)))
+        zf.writestr(GbkInfo("红方/帧1.txt"), "10 0.1 0.1 0.1 0.2 0.3 0.2 0.3 0.1\n")
+    with zipfile.ZipFile(io.BytesIO(zbuf.getvalue())) as zf:
+        assert not any(i.flag_bits & 0x800 for i in zf.infolist())
+        assert "红方/帧1.jpg" not in zf.namelist()  # 确认不修的话确实是乱码
+
+    r = admin.post(f"/api/tasks/{tid}/images", files=[("files", ("win.zip", zbuf.getvalue(), "application/zip"))])
+    assert r.status_code == 200, r.text
+    assert r.json()["added"] == 1 and r.json()["labels"]["matched"] == 1
+    items = admin.get(f"/api/tasks/{tid}/image-list", params={"assignee": "all"}).json()["items"]
+    assert [i["filename"] for i in items] == ["红方/帧1.jpg"]
+
+
+def test_natural_sort_long_numbers_and_migration(world: dict) -> None:
+    from sqlalchemy import update
+
+    from app import storage
+    from app.db import SessionLocal
+    from app.main import refresh_sort_keys
+    from app.models import Image
+
+    names = ["frame10.jpg", "cam_1000000000000.jpg", "frame2.jpg", "cam_999999999999.jpg", "frame001.jpg"]
+    assert sorted(names, key=storage.natural_key) == [
+        "cam_999999999999.jpg",
+        "cam_1000000000000.jpg",
+        "frame001.jpg",
+        "frame2.jpg",
+        "frame10.jpg",
+    ]
+
+    # 旧库里的 sort_key 是旧编码（补零到 12 位），启动时要按新规则重算
+    admin = world["admin"]
+    tid = admin.post("/api/tasks", json={"name": "sortkey", "label_config": ARMOR}).json()["id"]
+    files = [
+        ("files", ("cam_1000000000000.jpg", jpeg((5, 50, 5)), "image/jpeg")),
+        ("files", ("cam_999999999999.jpg", jpeg((6, 60, 6)), "image/jpeg")),
+    ]
+    admin.post(f"/api/tasks/{tid}/images", files=files)
+    old_key = lambda name: storage._DIGITS.sub(lambda m: m.group(0).lstrip("0").zfill(12), name.lower())  # noqa: E731
+    with SessionLocal() as db:
+        for img in db.query(Image).filter(Image.task_id == tid):
+            db.execute(update(Image).where(Image.id == img.id).values(sort_key=old_key(img.filename)))
+        db.commit()
+
+    assert refresh_sort_keys(batch=1) == 2
+    assert refresh_sort_keys() == 0  # 幂等
+    items = admin.get(f"/api/tasks/{tid}/image-list", params={"assignee": "all"}).json()["items"]
+    assert [i["filename"] for i in items] == ["cam_999999999999.jpg", "cam_1000000000000.jpg"]
