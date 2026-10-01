@@ -1,6 +1,7 @@
 .git
 data
 **/node_modules
+**/.venv
 frontend/dist
 **/__pycache__
 **/.pytest_cache
